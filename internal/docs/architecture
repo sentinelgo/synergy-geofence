@@ -1,0 +1,20 @@
+┌──────────┐
+│    UI    │
+└────┬─────┘
+     │ REST API
+     ▼
+┌──────────────────┐
+│ Geofence Service │  ← Stateless, horizontally scalable
+└──┬───────────┬───┘
+   │           │
+   ▼           ▼
+┌────────┐  ┌─────────────────┐
+│  DB    │  │  Pulsar Topic   │
+│(Source │  │  (Event Bus)    │
+│of Truth)│  └──┬──────────┬──┘
+└────────┘     │
+               ▼
+        ┌────────────┐
+        │Co-Location │
+        │  Service
+        └────────────┘

@@ -1,0 +1,545 @@
+openapi: 3.0.3
+info:
+  title: Geofence Service API
+  version: 1.0.0
+  description: |
+    CRUD and spatial lookup APIs for agency/client geofences. Geofences are
+    stored server-side as Oracle Spatial MDSYS.SDO_GEOMETRY and scoped by
+    agency (mandatory) and client (optional — a fence with no client_id
+    applies agency-wide). Every request/response carries an
+    x-correlation-id header for distributed tracing/log correlation.
+servers:
+  - url: /api/v1
+
+paths:
+  /health:
+    get:
+      summary: Service health check.
+      tags: [Health]
+      responses:
+        '200':
+          description: Service is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /agencies/{agency_id}/geofences:
+    parameters:
+      - $ref: '#/components/parameters/AgencyId'
+      - $ref: '#/components/parameters/CorrelationId'
+    post:
+      summary: Create a geofence.
+      tags: [Geofences]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeofenceRequest'
+      responses:
+        '201':
+          description: Geofence created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                  message:
+                    type: string
+                  type:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/Geofence'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      summary: List geofences for an agency.
+      description: The composite (agency_id, client_id) index backs this query — it is the primary access pattern for the table.
+      tags: [Geofences]
+      parameters:
+        - name: client_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Filter to a specific client. Omit to return both agency-wide and client-specific fences.
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, inactive, archived, deleted]
+          description: Omit to return every non-deleted geofence (deleted rows only surface when explicitly requested).
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 25
+            maximum: 200
+      responses:
+        '200':
+          description: Paginated geofence list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeofenceListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /agencies/{agency_id}/geofences/lookup:
+    parameters:
+      - $ref: '#/components/parameters/AgencyId'
+      - $ref: '#/components/parameters/CorrelationId'
+    get:
+      summary: Find active geofences containing a point.
+      description: |
+        The key spatial query pattern this service exists for: given a
+        device/user location, which active geofences (scoped to this
+        agency, optionally a client) contain it? Backed by the Oracle
+        Spatial index via SDO_RELATE(mask=ANYINTERACT).
+      tags: [Geofences]
+      parameters:
+        - name: lon
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Longitude in [-180, 180].
+        - name: lat
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Latitude in [-90, 90].
+        - name: client_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Geofences containing the point (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Geofence'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /agencies/{agency_id}/geofences/{geofence_id}:
+    parameters:
+      - $ref: '#/components/parameters/AgencyId'
+      - name: geofence_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/CorrelationId'
+    get:
+      summary: Get a geofence by id.
+      tags: [Geofences]
+      responses:
+        '200':
+          description: The geofence.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Geofence'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      summary: Update a geofence (optimistic concurrency via version).
+      tags: [Geofences]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGeofenceRequest'
+      responses:
+        '200':
+          description: Geofence updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                  message:
+                    type: string
+                  type:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/Geofence'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Version mismatch (optimistic concurrency conflict), or the new name collides with another geofence in this agency.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      summary: Delete a geofence (sets status to 'deleted').
+      description: |
+        Sets status -> deleted, a terminal state distinct from 'archived'
+        (which a client can still reach directly via PUT for its own
+        lifecycle purposes). There is no authentication in front of this
+        API, so the acting user must be supplied via user_id — it is
+        carried in the emitted DELETED event for downstream audit trails,
+        and recorded as the row's updated_by. Deleted geofences no longer
+        appear in GET list results unless status=deleted is explicitly
+        requested.
+      tags: [Geofences]
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Identity of whoever is performing the delete.
+      responses:
+        '200':
+          description: Geofence deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                  message:
+                    type: string
+                  type:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    AgencyId:
+      name: agency_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Agency scoping every geofence route.
+    CorrelationId:
+      name: x-correlation-id
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Propagated through to logs via log.CorrelationIdMiddleware; the caller may supply one, otherwise it is simply absent from log correlation.
+
+  responses:
+    BadRequest:
+      description: Invalid request (bad UUID, failed JSON binding, invalid geometry, etc).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Geofence not found for this agency.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: A geofence with this name already exists in the agency.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: Unexpected server/database error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - timestamp
+      properties:
+        status:
+          type: string
+          enum: [healthy, unhealthy]
+        timestamp:
+          type: string
+          format: date-time
+        version:
+          type: string
+        checks:
+          type: object
+          properties:
+            database:
+              type: string
+              enum: [healthy, unhealthy]
+            cache:
+              type: string
+              enum: [healthy, unhealthy]
+
+    GeoJsonPoint:
+      type: object
+      description: GeoJSON Point geometry.
+      required:
+        - type
+        - coordinates
+      properties:
+        type:
+          type: string
+          enum: [Point]
+        coordinates:
+          type: array
+          description: "[longitude, latitude] — longitude ∈ [-180, 180], latitude ∈ [-90, 90]."
+          minItems: 2
+          maxItems: 2
+          items:
+            type: number
+        address:
+          type: string
+          description: Free-text address/label for this geometry.
+
+    GeoJsonPolygon:
+      type: object
+      description: GeoJSON Polygon geometry.
+      required:
+        - type
+        - coordinates
+      properties:
+        type:
+          type: string
+          enum: [Polygon]
+        coordinates:
+          type: array
+          description: Array of linear rings. Each ring is an array of [longitude, latitude] pairs.
+          minItems: 1
+          items:
+            type: array
+            minItems: 4
+            items:
+              type: array
+              minItems: 2
+              maxItems: 2
+              items:
+                type: number
+        address:
+          type: string
+          description: Free-text address/label for this geometry.
+
+    GeoJsonCircle:
+      type: object
+      description: Circle geometry. Center is a [longitude, latitude] pair; radius is in meters.
+      required:
+        - type
+        - coordinates
+        - radius
+      properties:
+        type:
+          type: string
+          enum: [Circle]
+        coordinates:
+          type: array
+          description: "Center point [longitude, latitude] — longitude ∈ [-180, 180], latitude ∈ [-90, 90]."
+          minItems: 2
+          maxItems: 2
+          items:
+            type: number
+        radius:
+          type: number
+          description: Radius in meters. Must be > 0 and ≤ configured max limit.
+          exclusiveMinimum: 0
+        address:
+          type: string
+          description: Free-text address/label for this geometry.
+
+    GeoJsonRectangle:
+      type: object
+      description: Axis-aligned rectangle geometry (added beyond the original fragment so the API lines up with the geofence table's `type` CHECK constraint, which allows 'Rectangle'). There is no dedicated Oracle Spatial rectangle primitive — this is stored as an ordinary 4-corner polygon.
+      required:
+        - type
+        - coordinates
+      properties:
+        type:
+          type: string
+          enum: [Rectangle]
+        coordinates:
+          type: array
+          description: Exactly two [longitude, latitude] pairs — [southwest corner, northeast corner]. Rectangles that would cross the antimeridian (southwest longitude >= northeast longitude) are rejected.
+          minItems: 2
+          maxItems: 2
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: number
+        address:
+          type: string
+          description: Free-text address/label for this geometry.
+
+    GeoJson:
+      description: GeoJSON geometry. Coordinates follow [longitude, latitude] order. Discriminate on the type field.
+      oneOf:
+        - $ref: '#/components/schemas/GeoJsonPoint'
+        - $ref: '#/components/schemas/GeoJsonPolygon'
+        - $ref: '#/components/schemas/GeoJsonRectangle'
+        - $ref: '#/components/schemas/GeoJsonCircle'
+      discriminator:
+        propertyName: type
+        mapping:
+          Point:     '#/components/schemas/GeoJsonPoint'
+          Polygon:   '#/components/schemas/GeoJsonPolygon'
+          Rectangle: '#/components/schemas/GeoJsonRectangle'
+          Circle:    '#/components/schemas/GeoJsonCircle'
+
+    GeofenceRequest:
+      type: object
+      required:
+        - name
+        - geo_json
+        - status
+        - user_id
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 150
+          pattern: "^[A-Za-z0-9 '-]+$"
+          description: Letters, digits, spaces, hyphens, and apostrophes only. Must be unique within the agency (409 Conflict on collision).
+        geo_json:
+          $ref: '#/components/schemas/GeoJson'
+          description: Must be Circle, Polygon or Rectangle — Point is not a valid geofence shape. Circle radius must be between 10 and 10000 meters.
+        status:
+          type: string
+          enum: [active, inactive, archived, deleted]
+        user_id:
+          type: string
+          format: uuid
+          description: Identity recorded as created_by (create) or updated_by (update); there is no authentication middleware in front of this API yet.
+        client_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Added beyond the original fragment to support the geofence table's optional client scoping. Omit/null for an agency-wide fence.
+        exclude_from_colocation:
+          type: boolean
+          default: false
+          description: |
+            Added beyond the original fragment for the Known Locations
+            feature: circle geofences (parole offices, courthouses, etc.)
+            flagged here are candidates for exclusion from co-location
+            detection reports. The exclusion algorithm itself is Co-Location
+            Service logic, not implemented by this API.
+        notes:
+          type: string
+          maxLength: 500
+          nullable: true
+          description: Added beyond the original fragment. Free-text notes about this location (e.g. visiting hours, purpose).
+
+    UpdateGeofenceRequest:
+      allOf:
+        - $ref: '#/components/schemas/GeofenceRequest'
+        - type: object
+          required:
+            - version
+          properties:
+            version:
+              type: integer
+              description: Must match the current stored version; a mismatch returns 409 Conflict (optimistic concurrency).
+
+    Geofence:
+      allOf:
+        - $ref: '#/components/schemas/GeofenceRequest'
+        - type: object
+          required:
+            - id
+            - version
+            - agency_id
+          properties:
+            id:
+              type: string
+              format: uuid
+            agency_id:
+              type: string
+              format: uuid
+              description: Agency this geofence belongs to.
+            updated_by:
+              type: string
+              format: uuid
+              nullable: true
+              description: Added beyond the original fragment. Identity of whoever last updated this record, if it's been updated; null otherwise.
+            version:
+              type: integer
+              description: Version number of the geofence record, incremented on each update.
+
+    GeofenceListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Geofence'
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+
+    ErrorDetail:
+      type: object
+      properties:
+        code:
+          type: string
+        input:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
