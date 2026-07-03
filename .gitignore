@@ -27,6 +27,9 @@ go.work.sum
 # env file
 .env
 
+# local dev config with real DB credentials — never commit
+config.local.yml
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -1,0 +1,31 @@
+version: 1.0.0
+common:
+  server:
+    host: 0.0.0.0
+    port: 7010
+  datastore:
+    host: localhost
+    port: 1521
+    username: geofence_service
+    password: changeme
+    dbname: geofence.example.oraclevcn.com
+    config:
+      namingstrategy:
+        identifiermaxlength: 128
+      dialector:
+        type: oracle
+        preferredcase: screamingsnakecase
+        varcharsizeischarlength: true
+        namingcasesensitive: true
+        sessiontimezone: UTC
+    migration:
+      enabled: false
+
+# Event publishing (Apache Pulsar) — see pkg/events. Disabled by default so
+# the service runs without a broker for local development; geofence
+# mutations simply won't be published until this is enabled.
+pulsar:
+  enabled: false
+  service-url: pulsar://localhost:6650
+  topic: persistent://synergy/geofence/events
+  connection-timeout-seconds: 10
