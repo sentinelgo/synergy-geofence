@@ -285,9 +285,11 @@ func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
 
 // DeleteGeofence handles DELETE: it sets status -> deleted (a terminal
 // state distinct from Archived, which a client can still reach directly via
-// PUT for its own lifecycle purposes). Since this service has no auth, the
-// acting user is supplied by the caller via the required user_id query
-// param and recorded as the row's updated_by.
+// PUT for its own lifecycle purposes). The acting user is supplied by the
+// caller via the required user_id query param and recorded as the row's
+// updated_by; requireAgencyAdmin only verifies the caller is an Agency
+// Admin/System Administrator/Global Administrator for the target agency,
+// not that user_id matches the authenticated subject.
 func (x *GeofenceController) DeleteGeofence(c *gin.Context) {
 	ctx, span := otelx.StartTracer(gincommon.UnwrapContext(c))
 	defer otelx.End(span, nil)

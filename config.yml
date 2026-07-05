@@ -19,7 +19,37 @@ common:
         namingcasesensitive: true
         sessiontimezone: UTC
     migration:
-      enabled: false
+      enabled: true
+  sidecar:
+    base-url: http://localhost:8090
+  jwt:
+    verification:
+      # Disabled for local development so the service runs without a real
+      # IDP; flip to false (and confirm issuers/audiences) per environment
+      # to require and validate bearer tokens.
+      disabled: true
+      ignored:
+        - method: "*"
+          path: "/health"
+      issuers:
+        - issuer: https://id.dev.sentinelsyn.com
+          audience: ["dev.sentinelsyn.com"]
+        - issuer: https://agency.dev.sentinelsyn.com
+          audience: ["dev.sentinelsyn.com"]
+        - issuer: https://user.dev.sentinelsyn.com
+          audience: ["dev.sentinelsyn.com"]
+  signing:
+    verification:
+      block-unsigned: false
+      allow-unsigned: true
+      unsigned-paths:
+        - method: "*"
+          path: "/health"
+      allowed-issuers:
+        - https://id.dev.sentinelsyn.com
+        - https://user.dev.sentinelsyn.com
+        - https://agency.dev.sentinelsyn.com
+      blacklisted-kids: []
 
 # Event publishing (Apache Pulsar) — see pkg/events. Disabled by default so
 # the service runs without a broker for local development; geofence

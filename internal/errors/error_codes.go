@@ -41,6 +41,7 @@ const (
 	ErrDuplicate       = "ERR_DUPLICATE"
 	ErrInvalidName     = "ERR_INVALID_NAME"
 	ErrCommon          = "ERR_COMMON"
+	ErrAuth            = "ERR_AUTH"
 )
 
 type ErrorInput string
@@ -56,4 +57,5 @@ const (
 	Pagination  ErrorInput = "pagination"
 	Name        ErrorInput = "name"
 	UserId      ErrorInput = "user_id"
+	Claims      ErrorInput = "claims"
 )

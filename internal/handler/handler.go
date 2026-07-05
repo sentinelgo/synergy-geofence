@@ -3,7 +3,7 @@ package handler
 import (
 	"context"
 	"fmt"
-	"net/http"
+	gohttp "net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -19,9 +19,12 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
 
+	auth "github.com/sentinelgo/synergy-common/pkg/authz/resolver"
 	"github.com/sentinelgo/synergy-common/pkg/config"
 	db "github.com/sentinelgo/synergy-common/pkg/database"
 	"github.com/sentinelgo/synergy-common/pkg/database/migration"
+	"github.com/sentinelgo/synergy-common/pkg/http"
+	"github.com/sentinelgo/synergy-common/pkg/http/token"
 	"github.com/sentinelgo/synergy-common/pkg/log"
 	"github.com/sentinelgo/synergy-common/pkg/otelx"
 	gincommon "github.com/sentinelgo/synergy-common/pkg/otelx/gin"
@@ -52,11 +55,47 @@ func Execute() {
 		}
 	}
 
+	if cfg.Common.Jwt.HasJwtVerification() {
+		if viper.GetString("jwt.subject") != "" {
+			viper.Set("jwt.subject", "")
+		}
+	}
+
+	client := &gohttp.Client{}
+	if cfg.Common.Signing.HasSigning() {
+		client = http.NewSigningClient(router, cfg.Common.Signing.Client.Issuer, cfg.Common.Signing.Client.Keys...)
+		l.Info("http message signing enabled")
+	} else {
+		l.Info("http message signing disabled")
+	}
+	authzClient := auth.NewAuthzClient(client, cfg)
+
 	// gin.Recovery() first so a panicking handler still gets a JSON 500
 	// response and a logged stack trace instead of crashing the process.
 	router.
 		Use(gin.Recovery()).
 		Use(log.CorrelationIdMiddleware())
+
+	jwtCfg := cfg.Common.Jwt.Verification
+	signingCfg := cfg.Common.Signing.Verification
+	jwtEnabled := !jwtCfg.Disabled && (len(jwtCfg.Issuers) > 0 || jwtCfg.Machine.Hydra != nil)
+	signingEnabled := !signingCfg.Disabled
+	if jwtEnabled || signingEnabled {
+		policy := token.NewPathPolicyFromConfig(jwtCfg, signingCfg, false)
+		mw, terr := token.NewMiddleware(jwtCfg, signingCfg, policy)
+		if terr != nil {
+			l.With("error", terr).Error("could not initialize token middleware")
+			panic(terr)
+		}
+		router.Use(mw)
+		l.With(
+			"jwt", jwtEnabled && len(jwtCfg.Issuers) > 0,
+			"opaque", !jwtCfg.Disabled && jwtCfg.Machine.Hydra != nil,
+			"signed", signingEnabled,
+		).Info("authorization token verification is enabled")
+	} else {
+		l.Warn("authorization token verification is disabled")
+	}
 
 	router.GET("/health", healthCheck)
 
@@ -96,24 +135,29 @@ func Execute() {
 
 	gc := NewGeofenceController(gdbc, cfg, publisher)
 
+	claimsMiddleware := claimsValidationMiddleware(authzClient)
+
 	v1 := router.Group("/api/v1")
 	agencyGeofences := v1.Group("/agencies/:agency_id/geofences")
-	agencyGeofences.Use(withAgencyId)
+	agencyGeofences.Use(withAgencyId, claimsMiddleware)
 
+	// Known Locations Management is admin-only: Agency Admin, System
+	// Administrator or Global Administrator may create/update/delete;
+	// Read-Only Administrators may additionally view (see auth.go).
 	agencyGeofences.
-		POST("", gc.CreateGeofence).
-		GET("", gc.ListGeofences).
-		GET("/lookup", gc.LookupGeofences).
-		GET("/:geofence_id", gc.GetGeofence).
-		PUT("/:geofence_id", gc.UpdateGeofence).
-		DELETE("/:geofence_id", gc.DeleteGeofence)
+		POST("", requireAgencyAdmin, gc.CreateGeofence).
+		GET("", requireAgencyViewer, gc.ListGeofences).
+		GET("/lookup", requireAgencyViewer, gc.LookupGeofences).
+		GET("/:geofence_id", requireAgencyViewer, gc.GetGeofence).
+		PUT("/:geofence_id", requireAgencyAdmin, gc.UpdateGeofence).
+		DELETE("/:geofence_id", requireAgencyAdmin, gc.DeleteGeofence)
 
 	l.With("version", fmt.Sprintf("v%s", cfg.Version)).Info("geofence service ready")
 	l.With("error", router.Run(cfg.Common.Server.HostPort())).Error("geofence service ended")
 }
 
 func healthCheck(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(gohttp.StatusOK, gin.H{
 		"status":  "healthy",
 		"service": fmt.Sprintf("geofence v%s branch=%s date=%s", viper.GetString("version"), viper.GetString("branch"), viper.GetString("date")),
 	})
@@ -131,13 +175,13 @@ func withAgencyId(c *gin.Context) {
 
 	agencyIdParam := c.Param("agency_id")
 	if len(agencyIdParam) == 0 {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrMissingFields, localerrors.AgencyId)})
+		c.AbortWithStatusJSON(gohttp.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrMissingFields, localerrors.AgencyId)})
 		return
 	}
 
 	agencyId, err := uuid.Parse(agencyIdParam)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrUUIDParse, localerrors.AgencyId)})
+		c.AbortWithStatusJSON(gohttp.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrUUIDParse, localerrors.AgencyId)})
 		return
 	}
 
