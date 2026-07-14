@@ -1,0 +1,48 @@
+# Thin edge proxy: geofence-service already verifies JWTs and HTTP message
+# signatures in-app (internal/handler/handler.go), so unlike participant's
+# oathkeeper this doesn't re-check tokens or scopes — it only terminates
+# TLS, does host-based routing, and stamps a correlation id. Every route
+# below uses `noop`/`allow` on purpose; auth stays the app's job.
+log:
+  level: trace
+  leak_sensitive_values: true
+  format: json
+
+serve:
+  proxy:
+    timeout:
+      idle: 60s
+      read: 60s
+      write: 60s
+    trust_forwarded_headers: true
+
+errors:
+  fallback:
+    - json
+  handlers:
+    json:
+      enabled: true
+      config:
+        verbose: true
+
+access_rules:
+  repositories:
+    - file://{{ config_ref "access_rules_internal" }}
+    - file://{{ config_ref "access_rules" }}
+
+authenticators:
+  noop:
+    enabled: true
+
+authorizers:
+  allow:
+    enabled: true
+
+mutators:
+  noop:
+    enabled: true
+  header:
+    enabled: true
+    config:
+      headers:
+        X-Correlation-Id: '{{ escape_template `{{ print (.MatchContext.Header.Get "X-Correlation-ID") }}` }}'

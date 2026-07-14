@@ -1,0 +1,42 @@
+image: {{ config_value "geofence_image" }}
+egress: true
+args:
+  - serve
+  - --config
+  - {{ config_ref "config_file" }}
+  - --config
+  - {{ secret_ref "secrets_file" }}
+replicas: 0
+restart_policy:
+  condition: on-failure
+  max_attempts: 3
+  delay: 5s
+  window: 30s
+labels:
+  traefik.enable: "false"
+configs:
+  - name: config_file
+    source: templates/stacks/geofence/services/geofence/configs/config.yaml.tmpl
+    target: /etc/config.yaml
+secrets:
+  - name: secrets_file
+    source: templates/stacks/geofence/services/geofence/secrets/config-secrets.yaml.tmpl
+    target: /run/secrets/config-secrets.yaml
+overlays:
+  partitions:
+    - name: dev
+      match:
+        partition: dev
+      replicas: 1
+    - name: qa
+      match:
+        partition: qa
+      replicas: 2
+    - name: demo
+      match:
+        partition: demo
+      replicas: 1
+    - name: prod
+      match:
+        partition: prod
+      replicas: 2

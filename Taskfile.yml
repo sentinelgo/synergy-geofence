@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+vars:
+  JQ_TOOLS_IMAGE: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+  DRONE_SERVER: https://drone.core.sentinelsyn.com
+  DOCKER_REPO: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices
+  REPO: sentinelgo/synergy-geofence
+tasks:
+  build-tools:
+    desc: Build and push curl/git/jq/task/crane tools image for Drone notify steps
+    cmds:
+      - |
+        digest="$(crane digest {{.DOCKER_REPO}}:tools 2>/dev/null || true)"
+        if [ -n "${digest}" ]; then
+          crane delete {{.DOCKER_REPO}}@"${digest}"
+        else
+          echo "no existing {{.DOCKER_REPO}}:tools image digest found; skipping delete"
+        fi
+        docker build -f- -t "{{.JQ_TOOLS_IMAGE}}" . <<'EOF'
+        # syntax=docker/dockerfile:1.5
+        FROM alpine:3.21
+        RUN set -eux; \
+          apk add --no-cache ca-certificates crane curl jq git go-task openssh-client; \
+          ln -sf /usr/bin/go-task /usr/local/bin/task; \
+          update-ca-certificates
+        EOF
+      - docker push "{{.JQ_TOOLS_IMAGE}}"
+  sign:
+    desc: Sign the .drone.yml
+    cmds:
+      - |
+        drone sign --save "{{.REPO}}"
+  write-version:
+    desc: Write the version number to a file
+    cmds:
+      - |
+        version_value=""
+        if [ -n "${DRONE_SEMVER:-}" ]; then
+          version_value="${DRONE_SEMVER}"
+        else
+          head_tag="$(git tag --points-at HEAD | head -n 1 || true)"
+          if [ -n "${head_tag}" ]; then
+            version_value="${head_tag}"
+          fi
+        fi
+        if [ -z "${version_value}" ]; then
+          short_sha="$(printf '%s' "${DRONE_COMMIT_SHA:-unknown}" | cut -c1-12)"
+          version_value="dev-${short_sha}"
+        fi
+        printf '%s\n' "${version_value}" > .version
+        echo "wrote .version=${version_value}"

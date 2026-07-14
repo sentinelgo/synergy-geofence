@@ -1,0 +1,69 @@
+# geofence-service config, rendered per partition (dev/qa/demo/prod).
+#
+# ASSUMPTIONS carried over from the standalone deploy.sh path — confirm
+# with ops before relying on this in a real environment:
+#   - geofence shares the same Oracle cluster/service as participant
+#     (db_host / db_service_name below); only the schema user differs
+#     ("geofence_service", fixed across all partitions).
+#   - "sidecar" (synergy-sidecar) and "user" (synergy-auth) are not yet
+#     registered as platform stacks, so their addresses are CHANGEME below.
+#     Once they're onboarded the same way, replace with config_path/
+#     runtime_value lookups instead of literals.
+version: 1.0.0
+common:
+  server:
+    host: 0.0.0.0
+    port: 7010
+  datastore:
+    host: {{ config_value "db_host" }}
+    port: 1521
+    username: geofence_service
+    # password comes from the secrets file (config-secrets.yaml.tmpl),
+    # merged on top since it's passed as the second --config flag.
+    dbname: {{ config_value "db_service_name" }}
+    config:
+      namingstrategy:
+        identifiermaxlength: 128
+      dialector:
+        type: oracle
+        preferredcase: screamingsnakecase
+        varcharsizeischarlength: true
+        namingcasesensitive: true
+        sessiontimezone: UTC
+    migration:
+      enabled: true
+  sidecar:
+    base-url: http://CHANGEME:8090
+  jwt:
+    verification:
+      disabled: false
+      ignored:
+        - method: "*"
+          path: "/health"
+      issuers:
+        - issuer: "{{ config_path "runtime.urls.identity" }}"
+          audience: ["{{ config_path "runtime.auth.audience_partitioned_sso" }}"]
+        - issuer: "{{ config_path "runtime.urls.agency" }}"
+          audience: ["{{ config_path "runtime.auth.audience_partitioned_sso" }}"]
+        - issuer: "https://user.CHANGEME"
+          audience: ["{{ config_path "runtime.auth.audience_partitioned_sso" }}"]
+  signing:
+    verification:
+      block-unsigned: false
+      allow-unsigned: true
+      unsigned-paths:
+        - method: "*"
+          path: "/health"
+      allowed-issuers:
+        - "{{ config_path "runtime.urls.identity" }}"
+        - "https://user.CHANGEME"
+        - "{{ config_path "runtime.urls.agency" }}"
+      blacklisted-kids: []
+
+# Centrally hosted Pulsar cluster shared by other services — reuses the
+# same broker address participant's consumer connects to.
+pulsar:
+  enabled: true
+  service-url: "{{ config_path "pulsar.manager_url" }}"
+  topic: persistent://synergy/geofence/events
+  connection-timeout-seconds: 10

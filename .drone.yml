@@ -1,0 +1,1111 @@
+---
+kind: secret
+name: github_token
+get:
+  path: platform/core/drone
+  name: github_token
+---
+kind: secret
+name: drone_token
+get:
+  path: platform/core/drone
+  name: drone_machine_api_key
+---
+kind: pipeline
+name: ci
+
+clone:
+  depth: 0
+
+workspace:
+  path: /drone/src
+
+steps:
+  - name: test
+    image: golang:1.25.6
+    pull-image: if-not-exists
+    privileged: true
+    environment:
+      CGO_ENABLED: 1
+      GOPRIVATE: github.com/sentinelgo/*
+      GONOSUMDB: github.com/sentinelgo/*
+      GOCACHE: /root/.cache/go-build
+      GOMODCACHE: /go/pkg/mod
+      GOPROXY: direct
+    commands:
+      - go mod download
+      - go vet ./...
+      - go test -race -count=1 ./...
+
+  - name: ssh-bootstrap
+    image: chrismoran/ssh-bootstrap-drone:v0.1.0-next.1
+    pull-image: if-not-exists
+    depends_on: [ test ]
+    environment:
+      HOME: /drone/src
+      REPO_DEVOPS_KEY:
+        from_secret: synergy_devops_deploy
+      REPO_COMMON_KEY:
+        from_secret: synergy_common_deploy
+      REPO_GEOFENCE_KEY:
+        from_secret: synergy_geofence_deploy
+    settings:
+      git_rewrite: true
+      ssh_dir: /drone/src/.ssh
+      cleanup_on_exit: false
+      config_name: config
+      docker_config:
+        from_secret: docker_config
+      mappings: |
+        - name: devops
+          repo: sentinelgo/synergy-devops
+          key_env: REPO_DEVOPS_KEY
+        - name: common
+          repo: sentinelgo/synergy-common
+          key_env: REPO_COMMON_KEY
+        - name: geofence
+          repo: sentinelgo/synergy-geofence
+          key_env: REPO_GEOFENCE_KEY
+
+  - name: semantic-release
+    image: chrismoran/semantic-release-go:v0.7.0
+    pull-image: if-not-exists
+    when:
+      event: [ push ]
+    depends_on: [ test, ssh-bootstrap ]
+    environment:
+      DRY_RUN: "true"
+      VERSION_FILE: .version
+      MAIN_BRANCH: main
+      PRERELEASE_BRANCHES: feat/*,dev/*
+      GITHUB_TOKEN:
+        from_secret: github_token
+
+  - name: write-version-file
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    depends_on: [ semantic-release ]
+    commands:
+      - |
+        set -euo pipefail
+        if [ -s .version ]; then
+          echo "semantic-release computed version $$(cat .version)"
+        else
+          task write-version
+        fi
+        VERSION="$$(tr -d '\n' < .version)"
+        drone-output set version "$${VERSION}"
+    when:
+      event: [ push ]
+
+  - name: build-and-push
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:plugins.-docker__v21.4.1-next.1
+    pull-image: if-not-exists
+    privileged: true
+    depends_on: [ write-version-file ]
+    environment:
+      RUN_GO_GENERATE: "1"
+    settings:
+      build_args_from_env:
+        - DRONE_COMMIT_SHA
+        - DRONE_BUILD_CREATED
+        - DRONE_SOURCE_BRANCH
+        - DRONE_REPO_NAME
+        - DRONE_REPO_SEMVER
+        - DRONE_REPO_LINK
+        - DRONE_SEMVER
+        - RUN_GO_GENERATE
+      username:
+        from_secret: registry_username
+      password:
+        from_secret: registry_password
+      repo: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices
+      registry: ocir.us-langley-1.oci.oraclegovcloud.com
+      dockerfile: Dockerfile
+      # deploy/Dockerfile's COPY steps reach the repo root via `..`, so the
+      # build context is deploy/ (not repo root) — matches how it was built
+      # under the previous Jenkins pipeline (see deploy/Dockerfile comments).
+      context: deploy
+      image_pull_secrets:
+        - docker_config
+      ssh_agent_key:
+        from_secret: synergy_common_deploy
+      artifact_file: .drone-docker-artifact.json
+      labels:
+        - org.opencontainers.image.title=${DRONE_REPO_NAME}
+        - org.opencontainers.image.source=${DRONE_GIT_HTTP_URL}
+        - org.opencontainers.image.revision=${DRONE_COMMIT_SHA}
+        - org.opencontainers.image.created=${DRONE_BUILD_CREATED}
+      tags:
+        - service.-${DRONE_REPO_NAME}__sha-${DRONE_COMMIT_SHA}
+        - service.-${DRONE_REPO_NAME}__branch-${DRONE_SOURCE_BRANCH//\//-}
+        - service.-${DRONE_REPO_NAME}__date-${DRONE_BUILD_CREATED}
+      outputs:
+        - tags
+        - digest
+        - primary_image_ref
+        - image_with_digest
+        - outputs.image_repo=repo
+    when:
+      event: [ push ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+
+  - name: create-and-push-release-tag
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    depends_on: [ build-and-push ]
+    environment:
+      HOME: /drone/src
+      GIT_CONFIG_GLOBAL: /drone/src/.gitconfig
+      GIT_SSH_COMMAND: ssh -F /drone/src/.ssh/config
+      VERSION:
+        from_output: write-version-file.version
+      IMAGE_WITH_DIGEST:
+        from_output: build-and-push.image_with_digest
+    commands:
+      - |
+        set -euo pipefail
+
+        if [ -z "$${VERSION}" ]; then
+          echo "missing version output"
+          exit 1
+        fi
+        if [ -z "$${IMAGE_WITH_DIGEST}" ]; then
+          echo "missing image_with_digest output"
+          exit 1
+        fi
+
+        if ! printf '%s' "$${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$$'; then
+          drone-output set release.tag none
+          drone-output set release.image "$${IMAGE_WITH_DIGEST}"
+          echo "not creating git tag for non-release version: $${VERSION}"
+          exit 0
+        fi
+
+        BUILD_TAG="build/$${DRONE_COMMIT_SHA}"
+        TAG="v$${VERSION}"
+        git fetch --tags origin
+
+        if git rev-parse -q --verify "refs/tags/$${BUILD_TAG}" >/dev/null; then
+          echo "build tag already exists: $${BUILD_TAG}"
+        else
+          git tag "$${BUILD_TAG}" "$${DRONE_COMMIT_SHA}"
+          git push origin "refs/tags/$${BUILD_TAG}"
+          echo "created and pushed build tag $${BUILD_TAG}"
+        fi
+
+        if git rev-parse -q --verify "refs/tags/$${TAG}" >/dev/null; then
+          TAG_COMMIT="$$(git rev-list -n 1 "$${TAG}")"
+          if [ "$${TAG_COMMIT}" = "$${DRONE_COMMIT_SHA}" ]; then
+            echo "git tag already exists on this commit: $${TAG}"
+          else
+            echo "git tag already exists on a different commit: $${TAG} -> $${TAG_COMMIT}; reusing existing release ref"
+          fi
+          drone-output set release.tag "$${TAG}"
+          drone-output set release.image "$${IMAGE_WITH_DIGEST}"
+          exit 0
+        fi
+
+        git tag "$${TAG}" "$${DRONE_COMMIT_SHA}"
+        git push origin "refs/tags/$${TAG}"
+        drone-output set release.tag "$${TAG}"
+        drone-output set release.image "$${IMAGE_WITH_DIGEST}"
+        echo "created and pushed git tag $${TAG}"
+    when:
+      event: [ push ]
+
+  # NOTE: teams_geofence_deploy_webhook does not exist as a Drone secret yet —
+  # provision it (same as teams_participant_deploy_webhook) before relying on
+  # these notify steps; until then they'll fail with a missing-secret error.
+  - name: notify-teams
+    depends_on: [ create-and-push-release-tag ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+      RELEASE_TAG:
+        from_output: create-and-push-release-tag.release.tag
+      RELEASE_IMAGE:
+        from_output: create-and-push-release-tag.release.image
+    commands:
+      - |
+        set -euo pipefail
+        release_ref="$${RELEASE_TAG:-none}"
+        release_image="$${RELEASE_IMAGE:-none}"
+        payload="$$(jq -nc --arg repo "$${DRONE_REPO_NAME}" --arg branch "$${DRONE_BRANCH}" --arg commit "$${DRONE_COMMIT_SHA}" --arg release_ref "$${release_ref}" --arg release_image "$${release_image}" --arg msg "$${DRONE_COMMIT_MESSAGE}" --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" '{text:"**🔹 CI Build Complete 🔹**  \n**Repository:** \($repo)  \n**Branch:** \($branch)  \n**Commit:** \($commit)  \n**Release Tag:** \($release_ref)  \n**Release Image:** \($release_image)  \n**Release Handoff:** handled by tag pipeline when a release tag is created  \n**Commit Message:**  \n\($msg)\n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+
+  - name: docker-untag-temp
+    image: docker:26-cli
+    privileged: true
+    depends_on: [ build-and-push ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+    commands:
+      - |
+        set -euo pipefail
+
+        # Find image IDs built in this pipeline (label set in your plugin step)
+        images=$(docker images -q --filter "label=org.opencontainers.image.revision=${DRONE_COMMIT_SHA}" | sort -u)
+        if [ -z "$images" ]; then
+          echo "no images found for revision ${DRONE_COMMIT_SHA}"
+          exit 0
+        fi
+
+        # For each image, remove only the random temp tag(s)
+        for id in $images; do
+          docker image inspect -f '{{ range .RepoTags }}{{ println . }}{{ end }}' "$id" \
+            | awk '/^[a-z0-9]{16,}:latest$/' \
+            | xargs -r docker rmi -f
+        done
+
+  - name: vuln-scan
+    image: aquasec/trivy:0.52.2
+    pull: if-not-exists
+    privileged: true
+    depends_on: [ build-and-push ]
+    environment:
+      IMAGE_REF:
+        from_output: build-and-push.primary_image_ref
+    commands:
+      - |
+        set -euo pipefail
+        if [ -z "$${IMAGE_REF}" ]; then
+          echo "missing primary_image_ref output"
+          exit 1
+        fi
+        trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress "$${IMAGE_REF}"
+    when:
+      event: [ push, pull_request ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+      - name: trivy-cache
+        path: /root/.cache/
+
+  - name: notify-teams-failure
+    depends_on: [ vuln-scan ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        failed_steps="$${DRONE_FAILED_STEPS:-unknown}"
+        reason="see failed step list in Drone"
+        case "$${failed_steps}" in
+          *semantic-release*)
+            reason="semantic-release could not determine a valid version; artifact build was intentionally blocked"
+            ;;
+          *write-version-file*)
+            reason="version file generation failed after semantic-release version resolution; artifact build was intentionally blocked"
+            ;;
+          *build-and-push*)
+            reason="image build or push failed after version resolution"
+            ;;
+        esac
+        payload="$$(jq -nc \
+          --arg repo "$${DRONE_REPO_NAME}" \
+          --arg branch "$${DRONE_BRANCH}" \
+          --arg commit "$${DRONE_COMMIT_SHA}" \
+          --arg failed_steps "$${failed_steps}" \
+          --arg failed_stages "$${DRONE_FAILED_STAGES:-unknown}" \
+          --arg status "$${DRONE_BUILD_STATUS:-failure}" \
+          --arg reason "$${reason}" \
+          --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" \
+          '{text:"**🔴 CI Build Failed 🔴**  \n**Repository:** \($repo)  \n**Branch:** \($branch)  \n**Commit:** \($commit)  \n**Status:** \($status)  \n**Reason:** \($reason)  \n**Failed Steps:** \($failed_steps)  \n**Failed Stages:** \($failed_stages)  \n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+    when:
+      status: [ failure ]
+
+image_pull_secrets:
+  - docker_config
+
+trigger:
+  branch:
+    - main
+  event: [ push ]
+
+volumes:
+  - name: dockersock
+    host:
+      path: /var/run/docker.sock
+  - name: trivy-cache
+    host:
+      path: /tmp/drone-trivy-cache
+---
+kind: pipeline
+name: release-tag
+
+clone:
+  depth: 0
+
+workspace:
+  path: /drone/src
+
+trigger:
+  event: [ tag ]
+  ref:
+    include:
+      - refs/tags/v[0-9]*.[0-9]*.[0-9]*
+    exclude:
+      - refs/tags/v*-.*
+
+steps:
+  - name: notify-teams
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        payload="$$(jq -nc --arg repo "$${DRONE_REPO_NAME}" --arg tag "$${DRONE_TAG}" --arg commit "$${DRONE_COMMIT_SHA}" --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" '{text:"**🔹 Release Tag Created 🔹**  \n**Repository:** \($repo)  \n**Release Ref:** \($tag)  \n**Commit:** \($commit)  \n**Deployment:** none; use Drone promote to deploy this release  \n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+
+  - name: notify-teams-failure
+    depends_on: [ notify-teams ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        payload="$$(jq -nc --arg repo "$${DRONE_REPO_NAME}" --arg tag "$${DRONE_TAG:-unknown}" --arg failed_steps "$${DRONE_FAILED_STEPS:-unknown}" --arg failed_stages "$${DRONE_FAILED_STAGES:-unknown}" --arg status "$${DRONE_BUILD_STATUS:-failure}" --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" '{text:"**🔴 Release Tag Pipeline Failed 🔴**  \n**Repository:** \($repo)  \n**Release Ref:** \($tag)  \n**Status:** \($status)  \n**Failed Steps:** \($failed_steps)  \n**Failed Stages:** \($failed_stages)  \n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+    when:
+      status: [ failure ]
+
+image_pull_secrets:
+  - docker_config
+
+---
+kind: pipeline
+name: ci-promote
+
+clone:
+  depth: 0
+
+trigger:
+  event: [ promote ]
+
+image_pull_secrets:
+  - docker_config
+
+volumes:
+  - name: dockersock
+    host:
+      path: /var/run/docker.sock
+
+steps:
+  - name: ssh-bootstrap
+    image: chrismoran/ssh-bootstrap-drone:v0.1.0-next.1
+    pull-image: if-not-exists
+    environment:
+      HOME: /drone/src
+      REPO_DEVOPS_KEY:
+        from_secret: synergy_devops_deploy
+      REPO_COMMON_KEY:
+        from_secret: synergy_common_deploy
+      REPO_GEOFENCE_KEY:
+        from_secret: synergy_geofence_deploy
+    settings:
+      git_rewrite: true
+      ssh_dir: /drone/src/.ssh
+      cleanup_on_exit: false
+      config_name: config
+      docker_config:
+        from_secret: docker_config
+      mappings: |
+        - name: devops
+          repo: sentinelgo/synergy-devops
+          key_env: REPO_DEVOPS_KEY
+        - name: common
+          repo: sentinelgo/synergy-common
+          key_env: REPO_COMMON_KEY
+        - name: geofence
+          repo: sentinelgo/synergy-geofence
+          key_env: REPO_GEOFENCE_KEY
+
+  - name: validate-promote-inputs
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    depends_on: [ ssh-bootstrap ]
+    commands:
+      - |
+        set -euo pipefail
+        if [ -z "$${DRONE_DEPLOY_TO:-}" ]; then
+          echo "DRONE_DEPLOY_TO is required for promote"
+          exit 1
+        fi
+        # prod is intentionally excluded: swarm/geofence/project.yaml (synergy-devops)
+        # has no prod node/partition/deployment_target yet — add it there first.
+        case "$${DRONE_DEPLOY_TO}" in
+          dev|qa|demo)
+            ;;
+          *)
+            echo "DRONE_DEPLOY_TO must be one of: dev, qa, demo"
+            exit 1
+            ;;
+        esac
+
+        if [ -n "$${DRONE_TAG:-}" ]; then
+          echo "promoting tagged geofence ref: $${DRONE_TAG}"
+          exit 0
+        fi
+
+        case "$${DRONE_SOURCE_BRANCH:-$${DRONE_BRANCH:-}}" in
+          hotfix/*)
+            echo "promoting hotfix geofence commit: $${DRONE_COMMIT_SHA}"
+            exit 0
+            ;;
+        esac
+
+        echo "promote requires either a tagged release build or a hotfix/* branch build"
+        exit 1
+
+  - name: trigger-devops-tag-promote
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:plugins.-downstream__v1.5.3
+    pull-image: if-not-exists
+    depends_on: [ validate-promote-inputs ]
+    when:
+      ref:
+        include:
+          - refs/tags/v*
+    settings:
+      server: https://drone.core.sentinelsyn.com
+      token:
+        from_secret: drone_machine_api_key
+      repositories:
+        - sentinelgo/synergy-devops@main
+      event: custom
+      action: update-release-geofence
+      target: update-release-geofence
+      recursive_response_parse: true
+      retries: 0
+      params:
+        - GEOFENCE_REF=${DRONE_TAG}
+        - DEPLOY_TO=${DRONE_DEPLOY_TO}
+
+  - name: trigger-devops-hotfix-promote
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:plugins.-downstream__v1.5.3
+    pull-image: if-not-exists
+    depends_on: [ validate-promote-inputs ]
+    when:
+      branch:
+        include:
+          - hotfix/*
+    settings:
+      server: https://drone.core.sentinelsyn.com
+      token:
+        from_secret: drone_machine_api_key
+      repositories:
+        - sentinelgo/synergy-devops@main
+      event: custom
+      action: update-release-geofence
+      target: update-release-geofence
+      recursive_response_parse: true
+      retries: 0
+      params:
+        - GEOFENCE_REF=${DRONE_COMMIT_SHA}
+        - DEPLOY_TO=${DRONE_DEPLOY_TO}
+
+  - name: notify-teams-tag-promote
+    depends_on: [ trigger-devops-tag-promote ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    when:
+      ref:
+        include:
+          - refs/tags/v*
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        payload="$$(jq -nc --arg deploy_to "$${DRONE_DEPLOY_TO}" --arg geofence_ref "$${DRONE_TAG}" --arg repo "$${DRONE_REPO_NAME}" --arg branch "$${DRONE_BRANCH}" --arg commit "$${DRONE_COMMIT_SHA}" --arg msg "$${DRONE_COMMIT_MESSAGE}" --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" '{text:"**🔹 Promote Handoff Complete 🔹**  \n**Repository:** \($repo)  \n**Release Ref:** \($geofence_ref)  \n**Deploy-Target:** \($deploy_to)  \n**Branch:** \($branch)  \n**Commit:** \($commit)  \n**Action:** updated synergy-devops release state  \n**Commit Message:**  \n\($msg)\n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+
+  - name: notify-teams-hotfix-promote
+    depends_on: [ trigger-devops-hotfix-promote ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    when:
+      branch:
+        include:
+          - hotfix/*
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        payload="$$(jq -nc --arg deploy_to "$${DRONE_DEPLOY_TO}" --arg geofence_ref "$${DRONE_COMMIT_SHA}" --arg repo "$${DRONE_REPO_NAME}" --arg branch "$${DRONE_BRANCH}" --arg commit "$${DRONE_COMMIT_SHA}" --arg msg "$${DRONE_COMMIT_MESSAGE}" --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" '{text:"**🔹 Hotfix Promote Handoff Complete 🔹**  \n**Repository:** \($repo)  \n**Release Ref:** \($geofence_ref)  \n**Deploy-Target:** \($deploy_to)  \n**Branch:** \($branch)  \n**Commit:** \($commit)  \n**Action:** updated synergy-devops release state  \n**Commit Message:**  \n\($msg)\n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+
+  - name: notify-teams-failure
+    depends_on: [ validate-promote-inputs ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        geofence_ref="$${DRONE_TAG:-$${DRONE_COMMIT_SHA:-unknown}}"
+        payload="$$(jq -nc --arg deploy_to "$${DRONE_DEPLOY_TO:-unknown}" --arg geofence_ref "$${geofence_ref}" --arg repo "$${DRONE_REPO_NAME}" --arg commit "$${DRONE_COMMIT_SHA}" --arg failed_steps "$${DRONE_FAILED_STEPS:-unknown}" --arg failed_stages "$${DRONE_FAILED_STAGES:-unknown}" --arg status "$${DRONE_BUILD_STATUS:-failure}" --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" '{text:"**🔴 Promote Handoff Failed 🔴**  \n**Repository:** \($repo)  \n**Release Ref:** \($geofence_ref)  \n**Deploy-Target:** \($deploy_to)  \n**Status:** \($status)  \n**Failed Steps:** \($failed_steps)  \n**Failed Stages:** \($failed_stages)  \n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+    when:
+      status: [ failure ]
+
+---
+kind: pipeline
+name: ci-feature
+
+clone:
+  depth: 0
+
+steps:
+  - name: test
+    image: golang:1.25.6
+    pull-image: if-not-exists
+    privileged: true
+    environment:
+      CGO_ENABLED: 1
+    commands:
+      - go mod download
+      - go vet ./...
+      - go test -race -count=1 ./...
+
+  - name: ssh-bootstrap
+    image: chrismoran/ssh-bootstrap-drone:v0.1.0-next.1
+    pull-image: if-not-exists
+    environment:
+      HOME: /drone/src
+      REPO_DEVOPS_KEY:
+        from_secret: synergy_devops_deploy
+      REPO_COMMON_KEY:
+        from_secret: synergy_common_deploy
+      REPO_GEOFENCE_KEY:
+        from_secret: synergy_geofence_deploy
+    settings:
+      git_rewrite: true
+      ssh_dir: /drone/src/.ssh
+      cleanup_on_exit: false
+      config_name: config
+      docker_config:
+        from_secret: docker_config
+      mappings: |
+        - name: devops
+          repo: sentinelgo/synergy-devops
+          key_env: REPO_DEVOPS_KEY
+        - name: common
+          repo: sentinelgo/synergy-common
+          key_env: REPO_COMMON_KEY
+        - name: geofence
+          repo: sentinelgo/synergy-geofence
+          key_env: REPO_GEOFENCE_KEY
+
+  - name: semantic-release
+    image: chrismoran/semantic-release-go:v0.7.0
+    failure: ignore
+    pull-image: if-not-exists
+    when:
+      event: [ push ]
+    depends_on: [ test, ssh-bootstrap ]
+    environment:
+      DRY_RUN: "true"
+      VERSION_FILE: .version
+      MAIN_BRANCH: main
+      PRERELEASE_BRANCHES: feat/*,dev/*
+      GITHUB_TOKEN:
+        from_secret: github_token
+
+  - name: write-version-file
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    depends_on: [ semantic-release ]
+    commands:
+      - |
+        set -euo pipefail
+        task write-version
+        VERSION="$$(tr -d '\n' < .version)"
+        drone-output set version "$${VERSION}"
+    when:
+      event: [ push ]
+
+  - name: build-and-push
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:plugins.-docker__v21.4.1-next.1
+    pull-image: if-not-exists
+    privileged: true
+    depends_on: [ write-version-file ]
+    environment:
+      RUN_GO_GENERATE: "1"
+    settings:
+      build_args_from_env:
+        - DRONE_COMMIT_SHA
+        - DRONE_BUILD_CREATED
+        - DRONE_SOURCE_BRANCH
+        - DRONE_REPO_NAME
+        - DRONE_REPO_SEMVER
+        - DRONE_REPO_LINK
+        - DRONE_SEMVER
+        - RUN_GO_GENERATE
+      username:
+        from_secret: registry_username
+      password:
+        from_secret: registry_password
+      repo: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices
+      registry: ocir.us-langley-1.oci.oraclegovcloud.com
+      dockerfile: Dockerfile
+      context: deploy
+      image_pull_secrets:
+        - docker_config
+      ssh_agent_key:
+        from_secret: synergy_common_deploy
+      labels:
+        - org.opencontainers.image.title=${DRONE_REPO_NAME}
+        - org.opencontainers.image.source=${DRONE_GIT_HTTP_URL}
+        - org.opencontainers.image.revision=${DRONE_COMMIT_SHA}
+        - org.opencontainers.image.created=${DRONE_BUILD_CREATED}
+      tags:
+        - service.-${DRONE_REPO_NAME}__sha-${DRONE_COMMIT_SHA}
+        - service.-${DRONE_REPO_NAME}__branch-${DRONE_SOURCE_BRANCH//\//-}
+        - service.-${DRONE_REPO_NAME}__date-${DRONE_BUILD_CREATED}
+    when:
+      event: [ push ]
+    volumes:
+      - name: dockerconfig
+        path: /root/.docker/config.json
+      - name: dockersock
+        path: /var/run/docker.sock
+
+  - name: docker-untag-temp
+    image: docker:26-cli
+    privileged: true
+    depends_on: [ build-and-push ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+    commands:
+      - |
+        set -euo pipefail
+
+        # Find image IDs built in this pipeline (label set in your plugin step)
+        images=$(docker images -q --filter "label=org.opencontainers.image.revision=${DRONE_COMMIT_SHA}" | sort -u)
+        if [ -z "$images" ]; then
+          echo "no images found for revision ${DRONE_COMMIT_SHA}"
+          exit 0
+        fi
+
+        # For each image, remove only the random temp tag(s)
+        for id in $images; do
+          docker image inspect -f '{{ range .RepoTags }}{{ println . }}{{ end }}' "$id" \
+            | awk '/^[a-z0-9]{16,}:latest$/' \
+            | xargs -r docker rmi -f
+        done
+
+  - name: vuln-scan
+    image: aquasec/trivy:0.52.2
+    pull: if-not-exists
+    privileged: true
+    depends_on: [ build-and-push ]
+    commands:
+      - trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress "ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:service.-${DRONE_REPO_NAME}__sha-${DRONE_COMMIT_SHA}"
+    when:
+      event: [ push, pull_request ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+      - name: trivy-cache
+        path: /root/.cache/
+
+  - name: notify-teams-failure
+    depends_on: [ vuln-scan ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        failed_steps="$${DRONE_FAILED_STEPS:-unknown}"
+        reason="see failed step list in Drone"
+        case "$${failed_steps}" in
+          *semantic-release*)
+            reason="semantic-release could not determine a valid version; artifact build was intentionally blocked"
+            ;;
+          *write-version-file*)
+            reason="version file generation failed after semantic-release version resolution; artifact build was intentionally blocked"
+            ;;
+          *build-and-push*)
+            reason="image build or push failed after version resolution"
+            ;;
+        esac
+        payload="$$(jq -nc \
+          --arg repo "$${DRONE_REPO_NAME}" \
+          --arg branch "$${DRONE_BRANCH}" \
+          --arg commit "$${DRONE_COMMIT_SHA}" \
+          --arg failed_steps "$${failed_steps}" \
+          --arg failed_stages "$${DRONE_FAILED_STAGES:-unknown}" \
+          --arg status "$${DRONE_BUILD_STATUS:-failure}" \
+          --arg reason "$${reason}" \
+          --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" \
+          '{text:"**🔴 Feature Build Failed 🔴**  \n**Repository:** \($repo)  \n**Branch:** \($branch)  \n**Commit:** \($commit)  \n**Status:** \($status)  \n**Reason:** \($reason)  \n**Failed Steps:** \($failed_steps)  \n**Failed Stages:** \($failed_stages)  \n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+    when:
+      status: [ failure ]
+
+image_pull_secrets:
+  - docker_config
+
+trigger:
+  branch:
+    - feat/*
+  event: [ push ]
+
+volumes:
+  - name: dockersock
+    host:
+      path: /var/run/docker.sock
+  - name: trivy-cache
+    host:
+      path: /tmp/drone-trivy-cache
+---
+kind: pipeline
+name: ci-hotfix
+
+clone:
+  depth: 0
+
+workspace:
+  path: /drone/src
+
+steps:
+  - name: test
+    image: golang:1.25.6
+    pull-image: if-not-exists
+    privileged: true
+    environment:
+      CGO_ENABLED: 1
+      GOPRIVATE: github.com/sentinelgo/*
+      GONOSUMDB: github.com/sentinelgo/*
+      GOCACHE: /root/.cache/go-build
+      GOMODCACHE: /go/pkg/mod
+      GOPROXY: direct
+    commands:
+      - go mod download
+      - go vet ./...
+      - go test -race -count=1 ./...
+
+  - name: ssh-bootstrap
+    image: chrismoran/ssh-bootstrap-drone:v0.1.0-next.1
+    pull-image: if-not-exists
+    depends_on: [ test ]
+    environment:
+      HOME: /drone/src
+      REPO_DEVOPS_KEY:
+        from_secret: synergy_devops_deploy
+      REPO_COMMON_KEY:
+        from_secret: synergy_common_deploy
+      REPO_GEOFENCE_KEY:
+        from_secret: synergy_geofence_deploy
+    settings:
+      git_rewrite: true
+      ssh_dir: /drone/src/.ssh
+      cleanup_on_exit: false
+      config_name: config
+      docker_config:
+        from_secret: docker_config
+      mappings: |
+        - name: devops
+          repo: sentinelgo/synergy-devops
+          key_env: REPO_DEVOPS_KEY
+        - name: common
+          repo: sentinelgo/synergy-common
+          key_env: REPO_COMMON_KEY
+        - name: geofence
+          repo: sentinelgo/synergy-geofence
+          key_env: REPO_GEOFENCE_KEY
+
+  - name: write-version-file
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    depends_on: [ ssh-bootstrap ]
+    environment:
+      GIT_SSH_COMMAND: ssh -F /drone/src/.ssh/config
+    commands:
+      - |
+        set -euo pipefail
+        branch="$${DRONE_SOURCE_BRANCH:-$${DRONE_BRANCH:-}}"
+        case "$${branch}" in
+          hotfix/v*.*.x)
+            series="$${branch#hotfix/v}"
+            series="$${series%.x}"
+            if ! printf '%s\n' "$${series}" | grep -Eq '^[0-9]+\.[0-9]+$$'; then
+              echo "invalid hotfix release branch: $${branch}; expected hotfix/vMAJOR.MINOR.x"
+              exit 1
+            fi
+
+            git fetch --tags origin
+            escaped_series="$$(printf '%s\n' "$${series}" | sed 's/[.]/\\./g')"
+            head_tag="$$(git tag --points-at "$${DRONE_COMMIT_SHA}" | grep -E "^v$${escaped_series}\\.[0-9]+$$" | sort -V | tail -n 1 || true)"
+            if [ -n "$${head_tag}" ]; then
+              version="$${head_tag}"
+            else
+              latest_tag="$$(git tag -l "v$${series}.*" | grep -E "^v$${escaped_series}\\.[0-9]+$$" | sort -V | tail -n 1 || true)"
+              if [ -n "$${latest_tag}" ]; then
+                if ! git merge-base --is-ancestor "$${latest_tag}" "$${DRONE_COMMIT_SHA}"; then
+                  echo "latest hotfix tag $${latest_tag} is not an ancestor of $${DRONE_COMMIT_SHA}"
+                  echo "refusing to create a v$${series}.x tag from the wrong code line"
+                  exit 1
+                fi
+                patch="$${latest_tag##*.}"
+                patch="$$(($${patch} + 1))"
+              else
+                patch=0
+              fi
+              version="v$${series}.$${patch}"
+            fi
+
+            printf '%s\n' "$${version}" > .version
+            drone-output set release.tag "$${version}"
+            echo "wrote hotfix release .version=$${version}"
+            ;;
+          *)
+            task write-version
+            drone-output set release.tag none
+            ;;
+        esac
+        VERSION="$$(tr -d '\n' < .version)"
+        drone-output set version "$${VERSION}"
+    when:
+      event: [ push ]
+
+  - name: build-and-push
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:plugins.-docker__v21.4.1-next.1
+    pull-image: if-not-exists
+    privileged: true
+    depends_on: [ write-version-file ]
+    environment:
+      RUN_GO_GENERATE: "1"
+    settings:
+      build_args_from_env:
+        - DRONE_COMMIT_SHA
+        - DRONE_BUILD_CREATED
+        - DRONE_SOURCE_BRANCH
+        - DRONE_REPO_NAME
+        - DRONE_REPO_SEMVER
+        - DRONE_REPO_LINK
+        - DRONE_SEMVER
+        - RUN_GO_GENERATE
+      username:
+        from_secret: registry_username
+      password:
+        from_secret: registry_password
+      repo: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices
+      registry: ocir.us-langley-1.oci.oraclegovcloud.com
+      dockerfile: Dockerfile
+      context: deploy
+      image_pull_secrets:
+        - docker_config
+      ssh_agent_key:
+        from_secret: synergy_common_deploy
+      artifact_file: .drone-docker-artifact.json
+      labels:
+        - org.opencontainers.image.title=${DRONE_REPO_NAME}
+        - org.opencontainers.image.source=${DRONE_GIT_HTTP_URL}
+        - org.opencontainers.image.revision=${DRONE_COMMIT_SHA}
+        - org.opencontainers.image.created=${DRONE_BUILD_CREATED}
+      tags:
+        - service.-${DRONE_REPO_NAME}__sha-${DRONE_COMMIT_SHA}
+        - service.-${DRONE_REPO_NAME}__branch-${DRONE_SOURCE_BRANCH//\//-}
+        - service.-${DRONE_REPO_NAME}__date-${DRONE_BUILD_CREATED}
+      outputs:
+        - tags
+        - digest
+        - primary_image_ref
+        - image_with_digest
+        - outputs.image_repo=repo
+    when:
+      event: [ push ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+
+  - name: create-and-push-hotfix-tag
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    depends_on: [ write-version-file, build-and-push ]
+    environment:
+      HOME: /drone/src
+      GIT_CONFIG_GLOBAL: /drone/src/.gitconfig
+      GIT_SSH_COMMAND: ssh -F /drone/src/.ssh/config
+      RELEASE_TAG:
+        from_output: write-version-file.release.tag
+      IMAGE_WITH_DIGEST:
+        from_output: build-and-push.image_with_digest
+    commands:
+      - |
+        set -euo pipefail
+
+        if [ "$${RELEASE_TAG:-none}" = "none" ]; then
+          drone-output set release.tag none
+          drone-output set release.image "$${IMAGE_WITH_DIGEST:-}"
+          echo "not creating release tag for non-release hotfix branch"
+          exit 0
+        fi
+        if [ -z "$${IMAGE_WITH_DIGEST:-}" ]; then
+          echo "missing image_with_digest output"
+          exit 1
+        fi
+        if ! printf '%s\n' "$${RELEASE_TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then
+          echo "invalid hotfix release tag: $${RELEASE_TAG}"
+          exit 1
+        fi
+
+        git fetch --tags origin
+        if git rev-parse -q --verify "refs/tags/$${RELEASE_TAG}" >/dev/null; then
+          tag_commit="$$(git rev-list -n 1 "$${RELEASE_TAG}")"
+          if [ "$${tag_commit}" != "$${DRONE_COMMIT_SHA}" ]; then
+            echo "release tag $${RELEASE_TAG} already exists on a different commit: $${tag_commit}"
+            exit 1
+          fi
+          echo "release tag already exists on this commit: $${RELEASE_TAG}"
+        else
+          git tag "$${RELEASE_TAG}" "$${DRONE_COMMIT_SHA}"
+          git push origin "refs/tags/$${RELEASE_TAG}"
+          echo "created and pushed release tag $${RELEASE_TAG}"
+        fi
+
+        drone-output set release.tag "$${RELEASE_TAG}"
+        drone-output set release.image "$${IMAGE_WITH_DIGEST}"
+  - name: docker-untag-temp
+    image: docker:26-cli
+    privileged: true
+    depends_on: [ build-and-push ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+    commands:
+      - |
+        set -euo pipefail
+
+        # Find image IDs built in this pipeline (label set in your plugin step)
+        images=$(docker images -q --filter "label=org.opencontainers.image.revision=${DRONE_COMMIT_SHA}" | sort -u)
+        if [ -z "$images" ]; then
+          echo "no images found for revision ${DRONE_COMMIT_SHA}"
+          exit 0
+        fi
+
+        # For each image, remove only the random temp tag(s)
+        for id in $images; do
+          docker image inspect -f '{{ range .RepoTags }}{{ println . }}{{ end }}' "$id" \
+            | awk '/^[a-z0-9]{16,}:latest$/' \
+            | xargs -r docker rmi -f
+        done
+
+  - name: vuln-scan
+    image: aquasec/trivy:0.52.2
+    pull: if-not-exists
+    privileged: true
+    depends_on: [ build-and-push ]
+    environment:
+      IMAGE_REF:
+        from_output: build-and-push.primary_image_ref
+    commands:
+      - |
+        set -euo pipefail
+        if [ -z "$${IMAGE_REF}" ]; then
+          echo "missing primary_image_ref output"
+          exit 1
+        fi
+        trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress "$${IMAGE_REF}"
+    when:
+      event: [ push, pull_request ]
+    volumes:
+      - name: dockersock
+        path: /var/run/docker.sock
+      - name: trivy-cache
+        path: /root/.cache/
+
+  - name: notify-teams
+    depends_on: [ create-and-push-hotfix-tag, vuln-scan ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+      IMAGE_REF:
+        from_output: build-and-push.image_with_digest
+      RELEASE_TAG:
+        from_output: create-and-push-hotfix-tag.release.tag
+    commands:
+      - |
+        set -euo pipefail
+        image_ref="$${IMAGE_REF:-unknown}"
+        release_tag="$${RELEASE_TAG:-none}"
+        payload="$$(jq -nc --arg repo "$${DRONE_REPO_NAME}" --arg branch "$${DRONE_BRANCH}" --arg commit "$${DRONE_COMMIT_SHA}" --arg image_ref "$${image_ref}" --arg release_tag "$${release_tag}" --arg msg "$${DRONE_COMMIT_MESSAGE}" --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" '{text:"**🔹 Hotfix Image Build Complete 🔹**  \n**Repository:** \($repo)  \n**Branch:** \($branch)  \n**Commit:** \($commit)  \n**Release Tag:** \($release_tag)  \n**Image:** \($image_ref)  \n**Release Handoff:** promote this build to update release state and deploy  \n**Commit Message:**  \n\($msg)\n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+
+  - name: notify-teams-failure
+    depends_on: [ vuln-scan ]
+    image: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+    pull-image: if-not-exists
+    environment:
+      TEAMS_WEBHOOK:
+        from_secret: teams_geofence_deploy_webhook
+    commands:
+      - |
+        set -euo pipefail
+        failed_steps="$${DRONE_FAILED_STEPS:-unknown}"
+        reason="see failed step list in Drone"
+        case "$${failed_steps}" in
+          *write-version-file*)
+            reason="version file generation failed; image build was blocked"
+            ;;
+          *build-and-push*)
+            reason="image build or push failed"
+            ;;
+        esac
+        payload="$$(jq -nc \
+          --arg repo "$${DRONE_REPO_NAME}" \
+          --arg branch "$${DRONE_BRANCH}" \
+          --arg commit "$${DRONE_COMMIT_SHA}" \
+          --arg failed_steps "$${failed_steps}" \
+          --arg failed_stages "$${DRONE_FAILED_STAGES:-unknown}" \
+          --arg status "$${DRONE_BUILD_STATUS:-failure}" \
+          --arg reason "$${reason}" \
+          --arg link "https://drone.core.sentinelsyn.com/$${DRONE_REPO}/$${DRONE_BUILD_NUMBER}" \
+          '{text:"**🔴 Hotfix Image Build Failed 🔴**  \n**Repository:** \($repo)  \n**Branch:** \($branch)  \n**Commit:** \($commit)  \n**Status:** \($status)  \n**Reason:** \($reason)  \n**Failed Steps:** \($failed_steps)  \n**Failed Stages:** \($failed_stages)  \n\n**Build Log:** [View Here](\($link))"}')"
+        curl -sS -w "\nTeams notification HTTP %{http_code}\n" -X POST -H "Content-Type: application/json" -d "$${payload}" "$${TEAMS_WEBHOOK}" || echo "warning: Teams notification failed"
+    when:
+      status: [ failure ]
+
+image_pull_secrets:
+  - docker_config
+
+trigger:
+  branch:
+    - hotfix/*
+  event: [ push ]
+
+volumes:
+  - name: dockersock
+    host:
+      path: /var/run/docker.sock
+  - name: trivy-cache
+    host:
+      path: /tmp/drone-trivy-cache

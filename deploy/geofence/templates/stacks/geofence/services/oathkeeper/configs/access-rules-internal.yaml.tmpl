@@ -1,0 +1,71 @@
+{{- $gihost := joincompact "." "g" (config_path "runtime.naming.host_partition") (config_value "internal_domain") -}}
+{{- $task := runtime_value "http://tasks.{project}_{partition}_{stack}_geofence:7010" -}}
+### Internal facing — same no-op/allow policy as access-rules.yaml.tmpl;
+### geofence-service enforces auth itself.
+- id: "geofence-internal:v1:well-known"
+  upstream:
+    preserve_host: true
+    url: "{{ $task }}"
+  match:
+    url: "https://{{ $gihost }}<<(?:/.well-known/.*)>>"
+    methods:
+      - GET
+  authenticators:
+    - handler: noop
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: header
+  errors:
+    - handler: json
+
+- id: "geofence-internal:v1:health"
+  upstream:
+    preserve_host: true
+    url: "{{ $task }}"
+  match:
+    url: "https://{{ $gihost }}/health"
+    methods:
+      - GET
+  authenticators:
+    - handler: noop
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: header
+  errors:
+    - handler: json
+
+- id: "geofence-internal:v1:api"
+  upstream:
+    preserve_host: true
+    url: "{{ $task }}"
+  match:
+    url:
+      base: "https://{{ $gihost }}/api/v1/agencies/:agency_id/geofences"
+      paths:
+        - prefix: ""
+          branches:
+            - path: ""
+            - path: "/lookup"
+            - path: "/:geofence_id"
+      path_params:
+        - name: "agency_id"
+          type: "regex"
+          value: "[^/]+?"
+        - name: "geofence_id"
+          type: "regex"
+          value: "[^/]+?"
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+  authenticators:
+    - handler: noop
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: header
+  errors:
+    - handler: json

@@ -1,0 +1,71 @@
+{{- $gphost := joincompact "." "g" (config_path "runtime.naming.host_partition") (config_value "public_domain") -}}
+{{- $gihost := joincompact "." "g" (config_path "runtime.naming.host_partition") (config_value "internal_domain") -}}
+### External facing — auth/scopes are enforced by geofence-service itself,
+### not here (see oathkeeper.yaml.tmpl).
+- id: "geofence:v1:well-known"
+  upstream:
+    preserve_host: false
+    url: "https://{{ $gihost }}"
+  match:
+    url: "https://{{ $gphost }}<<(?:/.well-known/.*)>>"
+    methods:
+      - GET
+  authenticators:
+    - handler: noop
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: header
+  errors:
+    - handler: json
+
+- id: "geofence:v1:health"
+  upstream:
+    preserve_host: false
+    url: "https://{{ $gihost }}"
+  match:
+    url: "https://{{ $gphost }}/health"
+    methods:
+      - GET
+  authenticators:
+    - handler: noop
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: header
+  errors:
+    - handler: json
+
+- id: "geofence:v1:api"
+  upstream:
+    preserve_host: false
+    url: "https://{{ $gihost }}"
+  match:
+    url:
+      base: "https://{{ $gphost }}/api/v1/agencies/:agency_id/geofences"
+      paths:
+        - prefix: ""
+          branches:
+            - path: ""
+            - path: "/lookup"
+            - path: "/:geofence_id"
+      path_params:
+        - name: "agency_id"
+          type: "regex"
+          value: "[^/]+?"
+        - name: "geofence_id"
+          type: "regex"
+          value: "[^/]+?"
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+  authenticators:
+    - handler: noop
+  authorizer:
+    handler: allow
+  mutators:
+    - handler: header
+  errors:
+    - handler: json

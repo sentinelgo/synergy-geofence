@@ -1,0 +1,34 @@
+separate{{- $gphost := joincompact "." "g" (config_path "runtime.naming.host_partition") (config_value "public_domain") -}}
+{{- $gihost := joincompact "." "g" (config_path "runtime.naming.host_partition") (config_value "internal_domain") -}}
+image: {{ config_value "oathkeeper_image" }}
+egress: true
+replicas: 1
+labels:
+  traefik.enable: "true"
+  traefik.swarm.network: {{ runtime_value "{networks_shared}" }}
+  traefik.http.routers.geofence-oathkeeper-{partition}.entrypoints: websecure
+  traefik.http.routers.geofence-oathkeeper-{partition}.rule: '{{ printf "Host(`%s`)" $gphost }}'
+  traefik.http.routers.geofence-oathkeeper-{partition}.tls: "true"
+  traefik.http.routers.geofence-oathkeeper-{partition}.service: {{ runtime_value "geofence-oathkeeper-{partition}"}}
+  traefik.http.services.geofence-oathkeeper-{partition}.loadbalancer.server.port: "4455"
+  traefik.http.routers.geofence-oathkeeper-{partition}-internal.entrypoints: websecure
+  traefik.http.routers.geofence-oathkeeper-{partition}-internal.rule: '{{ printf "Host(`%s`)" $gihost }}'
+  traefik.http.routers.geofence-oathkeeper-{partition}-internal.tls: "true"
+  traefik.http.routers.geofence-oathkeeper-{partition}-internal.service: {{ runtime_value "geofence-oathkeeper-{partition}"}}
+args:
+  - serve
+  - --disable-telemetry
+  - --sqa-opt-out
+  - proxy
+  - -c
+  - {{ config_ref "oathkeeper_config" }}
+configs:
+  - name: access_rules_internal
+    source: templates/stacks/geofence/services/oathkeeper/configs/access-rules-internal.yaml.tmpl
+    target: /etc/oathkeeper/access-rules-internal.yml
+  - name: access_rules
+    source: templates/stacks/geofence/services/oathkeeper/configs/access-rules.yaml.tmpl
+    target: /etc/oathkeeper/access-rules.yml
+  - name: oathkeeper_config
+    source: templates/stacks/geofence/services/oathkeeper/configs/oathkeeper.yaml.tmpl
+    target: /etc/oathkeeper/oathkeeper.yml
