@@ -3,9 +3,9 @@
 version: '3'
 
 vars:
-  JQ_TOOLS_IMAGE: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices:tools
+  JQ_TOOLS_IMAGE: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy_application_services:tools
   DRONE_SERVER: https://drone.core.sentinelsyn.com
-  DOCKER_REPO: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy/coreservices
+  DOCKER_REPO: ocir.us-langley-1.oci.oraclegovcloud.com/focalpointcloud/synergy_application_services
   REPO: sentinelgo/synergy-geofence
 tasks:
   build-tools:

@@ -1,10 +1,4 @@
 # geofence-service config, rendered per partition (dev/qa/demo/prod).
-#
-# ASSUMPTIONS carried over from the standalone deploy.sh path — confirm
-# with ops before relying on this in a real environment:
-#   - geofence shares the same Oracle cluster/service as participant
-#     (db_host / db_service_name below); only the schema user differs
-#     ("geofence_service", fixed across all partitions).
 #   - "sidecar" (synergy-sidecar) and "user" (synergy-auth) are not yet
 #     registered as platform stacks, so their addresses are CHANGEME below.
 #     Once they're onboarded the same way, replace with config_path/
