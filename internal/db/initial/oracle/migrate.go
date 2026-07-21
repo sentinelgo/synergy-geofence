@@ -87,7 +87,7 @@ func (Geofence) TableName() string {
 // (a mandatory prerequisite for Oracle Spatial) and creates the spatial
 // index backing FindContainingPoint's SDO_RELATE query.
 //
-// SRID 8307 (spatial.DefaultSRID) matches the SRID used when constructing
+// SRID 4326 (spatial.DefaultSRID) matches the SRID used when constructing
 // SDO_GEOMETRY values in pkg/database/spatial — these must stay in sync.
 // This has not been validated against a live Oracle Spatial instance;
 // validate during integration testing.
