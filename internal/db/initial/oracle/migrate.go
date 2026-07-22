@@ -21,10 +21,10 @@ type MutableModel struct {
 	Version   uint64     `gorm:"not null;version" json:"version"`
 }
 
-// Geofence is the frozen genesis definition of the `geofence` table,
+// Geofence is the frozen genesis definition of the `geofence_rules` table,
 // matching the Core DDL:
 //
-//	CREATE TABLE geofence (
+//	CREATE TABLE geofence_rules (
 //	    id            RAW(16)            DEFAULT PRIMARY KEY,
 //	    agency_id     RAW(16)            NOT NULL,
 //	    client_id     RAW(16),
@@ -80,7 +80,7 @@ type Geofence struct {
 }
 
 func (Geofence) TableName() string {
-	return "geofence"
+	return "geofence_rules"
 }
 
 // CreateSpatialIndex registers the geometry column's dimensional metadata
@@ -93,14 +93,14 @@ func (Geofence) TableName() string {
 // validate during integration testing.
 func CreateSpatialIndex(tx *gorm.DB) error {
 	stmts := []string{
-		`DELETE FROM USER_SDO_GEOM_METADATA WHERE TABLE_NAME = 'GEOFENCE' AND COLUMN_NAME = 'GEOMETRY'`,
+		`DELETE FROM USER_SDO_GEOM_METADATA WHERE TABLE_NAME = 'GEOFENCE_RULES' AND COLUMN_NAME = 'GEOMETRY'`,
 		fmt.Sprintf(`INSERT INTO USER_SDO_GEOM_METADATA (TABLE_NAME, COLUMN_NAME, DIMINFO, SRID)
-VALUES ('GEOFENCE', 'GEOMETRY',
+VALUES ('GEOFENCE_RULES', 'GEOMETRY',
   MDSYS.SDO_DIM_ARRAY(
     MDSYS.SDO_DIM_ELEMENT('LONGITUDE', -180, 180, 0.005),
     MDSYS.SDO_DIM_ELEMENT('LATITUDE', -90, 90, 0.005)
   ), %d)`, spatial.DefaultSRID),
-		`CREATE INDEX idx_geofence_spatial ON geofence(geometry) INDEXTYPE IS MDSYS.SPATIAL_INDEX`,
+		`CREATE INDEX idx_geofence_spatial ON geofence_rules(geometry) INDEXTYPE IS MDSYS.SPATIAL_INDEX`,
 	}
 
 	for _, stmt := range stmts {

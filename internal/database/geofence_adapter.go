@@ -122,7 +122,7 @@ func (dbc *dbAdapter) CreateGeofence(ctx context.Context, g *model.Geofence) err
 	// autoUpdateTime tag only populates it via the normal callback
 	// pipeline, which this raw INSERT bypasses) — set it explicitly,
 	// matching created_at on first insert.
-	query := fmt.Sprintf(`INSERT INTO geofence (
+	query := fmt.Sprintf(`INSERT INTO geofence_rules (
 		id, created_at, updated_at, version, agency_id, client_id, name, type, geometry, geo_json, status,
 		exclude_from_colocation, notes, created_by
 	) VALUES (
@@ -202,7 +202,7 @@ func (dbc *dbAdapter) UpdateGeofence(ctx context.Context, g *model.Geofence, sel
 	setSQL = append(setSQL, "updated_at = :updated_at", "version = :new_version")
 	args = append(args, time.Now().UTC().Truncate(time.Microsecond), newVersion, uuidBytes(g.ID), g.Version)
 
-	query := fmt.Sprintf(`UPDATE geofence SET %s WHERE id = :id AND version = :expected_version`, strings.Join(setSQL, ", "))
+	query := fmt.Sprintf(`UPDATE geofence_rules SET %s WHERE id = :id AND version = :expected_version`, strings.Join(setSQL, ", "))
 
 	err := dbc.WithGormDB(ctx, func(db *gorm.DB) error {
 		result := db.Exec(query, args...)
@@ -267,7 +267,7 @@ func (dbc *dbAdapter) FindContainingPoint(ctx context.Context, agencyID uuid.UUI
 	query := `SELECT g.id, g.created_at, g.updated_at, g.version,
 	                 g.agency_id, g.client_id, g.name, g.type, g.geo_json, g.status,
 	                 g.exclude_from_colocation, g.notes, g.created_by, g.updated_by
-	          FROM geofence g
+	          FROM geofence_rules g
 	          WHERE g.agency_id = :agency_id
 	            AND g.status = :active_status`
 	args := []interface{}{agencyID, int(model.GeofenceStatusActive)}
