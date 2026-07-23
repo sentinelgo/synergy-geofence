@@ -4,11 +4,11 @@ common:
     host: 0.0.0.0
     port: 7010
   datastore:
-    host: localhost
+    host: 172.31.232.97
     port: 1521
-    username: geofence_service
-    password: changeme
-    dbname: geofence.example.oraclevcn.com
+    username: GEOFENCE_USER_DEV
+    password: "{{ORACLE_PASSWORD}}"
+    dbname: SYNQA.lswifppddb01.lswifppd.oraclevcn.com
     config:
       namingstrategy:
         identifiermaxlength: 128
@@ -19,7 +19,7 @@ common:
         namingcasesensitive: true
         sessiontimezone: UTC
     migration:
-      enabled: true
+      enabled: false
   sidecar:
     base-url: http://localhost:8090
   jwt:
@@ -55,7 +55,7 @@ common:
 # the service runs without a broker for local development; geofence
 # mutations simply won't be published until this is enabled.
 pulsar:
-  enabled: false
-  service-url: pulsar://localhost:6650
-  topic: persistent://synergy/geofence/events
+  enabled: true
+  service-url: pulsar://10.20.4.28:6651
+  topic: persistent://synergy/dev.geofences/geofence_events
   connection-timeout-seconds: 10

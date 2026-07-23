@@ -16,6 +16,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      - SERVER_PORT=${SERVER_PORT:-8180}
       - PULSAR_URL=${PULSAR_URL}
       - PULSAR_CONSUMER_TOPIC=persistent://synergy/${ACTIVE_ENVIRONMENT}.geofences/geofence_events
       - ORACLE_USER=${ORACLE_USER}
@@ -34,7 +35,12 @@ services:
       update_config:
         parallelism: 1
         order: stop-first
-        failure_action: rollback
+        # pause (not rollback) so a bad deploy stays visible for
+        # `docker service ps`/`logs` instead of silently reverting to the
+        # last-good image+secret — resume with `docker service update
+        # --force` (or a fixed redeploy) once the failure is diagnosed.
+        failure_action: pause
+        monitor: 30s
         delay: 10s
       rollback_config:
         parallelism: 1
@@ -52,7 +58,7 @@ services:
           cpus: "0.25"
           memory: 128M
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:$${SERVER_PORT:-8180}/api/v1/health"]
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:$${SERVER_PORT:-8180}/health"]
       interval: 30s
       timeout: 3s
       start_period: 10s
