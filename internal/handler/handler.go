@@ -56,8 +56,8 @@ func Execute() {
 	}
 
 	if cfg.Common.Jwt.HasJwtVerification() {
-		if viper.GetString("jwt.subject") != "" {
-			viper.Set("jwt.subject", "")
+		if viper.GetString("common.jwt.subject") != "" {
+			viper.Set("common.jwt.subject", "")
 		}
 	}
 

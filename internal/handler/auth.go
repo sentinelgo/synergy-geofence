@@ -36,7 +36,7 @@ func claimsValidationMiddleware(authzClient auth.AuthzClient) gin.HandlerFunc {
 // incoming request, in priority order: claims already resolved earlier in
 // the chain, claims attached by the token verification middleware, claims
 // attached by the auth0 JWT middleware, a local-development subject override
-// (viper "jwt.subject"), and finally a service-to-service fallback for
+// (viper "common.jwt.subject"), and finally a service-to-service fallback for
 // signed-but-unauthenticated (m2m) requests. Returns nil if none apply,
 // which happens whenever JWT verification is disabled for this environment.
 func claimsFromContext(c *gin.Context, authClient auth.AuthzClient) *auth.Jwt {
@@ -80,12 +80,12 @@ func claimsFromContext(c *gin.Context, authClient auth.AuthzClient) *auth.Jwt {
 		}
 	}
 
-	if viper.GetString("jwt.subject") != "" {
+	if viper.GetString("common.jwt.subject") != "" {
 		claims := &validator.ValidatedClaims{
 			RegisteredClaims: validator.RegisteredClaims{
-				Issuer:   viper.GetString("jwt.issuer"),
-				Subject:  viper.GetString("jwt.subject"),
-				Audience: viper.GetStringSlice("jwt.audience"),
+				Issuer:   viper.GetString("common.jwt.issuer"),
+				Subject:  viper.GetString("common.jwt.subject"),
+				Audience: viper.GetStringSlice("common.jwt.audience"),
 				Expiry:   time.Now().Add(5 * time.Hour).UnixMilli(),
 				ID:       uuid.NewString(),
 			},
@@ -132,6 +132,14 @@ func populateAuthJwtFromValidatedClaims(c *gin.Context, authClient auth.AuthzCli
 // Agency Admin role at the target agency. It must run after withAgencyId
 // and claimsValidationMiddleware.
 func requireAgencyAdmin(c *gin.Context) {
+	// No real IDP (and no reachable authz sidecar) in an environment that
+	// disables JWT verification, so there's no legitimate way to resolve a
+	// caller's actual role here. Skip the gate rather than reject everyone.
+	if viper.GetBool("common.jwt.verification.disabled") {
+		c.Next()
+		return
+	}
+
 	sc := pkg.Claims(c)
 	if sc == nil {
 		abortUnauthorized(c)
@@ -155,6 +163,12 @@ func requireAgencyAdmin(c *gin.Context) {
 // requireAgencyAdmin allows, plus sentinel Read-Only Administrators, may
 // view. It must run after withAgencyId and claimsValidationMiddleware.
 func requireAgencyViewer(c *gin.Context) {
+	// See requireAgencyAdmin: same dev-only bypass, same reasoning.
+	if viper.GetBool("common.jwt.verification.disabled") {
+		c.Next()
+		return
+	}
+
 	sc := pkg.Claims(c)
 	if sc == nil {
 		abortUnauthorized(c)
