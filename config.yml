@@ -2,13 +2,13 @@ version: 1.0.0
 common:
   server:
     host: 0.0.0.0
-    port: 7010
+    port: ${SERVER_PORT}
   datastore:
-    host: 172.31.232.97
-    port: 1521
-    username: GEOFENCE_USER_DEV
-    password: "{{ORACLE_PASSWORD}}"
-    dbname: SYNQA.lswifppddb01.lswifppd.oraclevcn.com
+    host: ${ORACLE_HOST}
+    port: ${ORACLE_PORT}
+    username: ${ORACLE_USER}
+    password: "${ORACLE_PASSWORD}"
+    dbname: ${ORACLE_SERVICE_NAME}
     config:
       namingstrategy:
         identifiermaxlength: 128
@@ -21,23 +21,23 @@ common:
     migration:
       enabled: false
   sidecar:
-    base-url: http://localhost:8090
+    base-url: ${SIDECAR_URL}
   jwt:
     verification:
-      # Disabled for local development so the service runs without a real
-      # IDP; flip to false (and confirm issuers/audiences) per environment
-      # to require and validate bearer tokens.
-      disabled: true
+      # Per environment: true where no real IDP is reachable (local/dev);
+      # false (with the issuers below actually enforced) once an environment
+      # has a real identity provider to validate bearer tokens against.
+      disabled: ${JWT_VERIFICATION_DISABLED}
       ignored:
         - method: "*"
           path: "/health"
       issuers:
-        - issuer: https://id.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
-        - issuer: https://agency.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
-        - issuer: https://user.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
+        - issuer: https://id.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
+        - issuer: https://agency.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
+        - issuer: https://user.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
   signing:
     verification:
       block-unsigned: false
@@ -46,9 +46,9 @@ common:
         - method: "*"
           path: "/health"
       allowed-issuers:
-        - https://id.dev.sentinelsyn.com
-        - https://user.dev.sentinelsyn.com
-        - https://agency.dev.sentinelsyn.com
+        - https://id.${IDENTITY_DOMAIN}
+        - https://user.${IDENTITY_DOMAIN}
+        - https://agency.${IDENTITY_DOMAIN}
       blacklisted-kids: []
 
 # Event publishing (Apache Pulsar) — see pkg/events. Disabled by default so
@@ -56,6 +56,6 @@ common:
 # mutations simply won't be published until this is enabled.
 pulsar:
   enabled: true
-  service-url: pulsar://10.20.4.28:6651
-  topic: persistent://synergy/dev.geofences/geofence_events
+  service-url: ${PULSAR_URL}
+  topic: persistent://synergy/${ACTIVE_ENVIRONMENT}.geofences/geofence_events
   connection-timeout-seconds: 10

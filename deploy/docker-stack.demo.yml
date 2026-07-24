@@ -1,0 +1,80 @@
+version: "3.9"
+
+services:
+  geofence-service:
+    image: ${REGISTRY}/${NAMESPACE}/${FOLDER}/${IMAGE_NAME}:${IMAGE_TAG}
+    ports:
+      - "${PUBLISHED_PORT:-8180}:${SERVER_PORT:-8180}"
+    secrets:
+      - source: geofence_config
+        target: /app/config.yml
+        uid: "1000"
+        gid: "1000"
+        mode: 0440
+    networks:
+      - geofence-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - SERVER_PORT=${SERVER_PORT:-8180}
+      - PULSAR_URL=${PULSAR_URL}
+      - PULSAR_CONSUMER_TOPIC=persistent://synergy/${ACTIVE_ENVIRONMENT}.geofences/geofence_events
+      - ORACLE_USER=${ORACLE_USER}
+      - ORACLE_PASSWORD=${ORACLE_PASSWORD}
+      - ORACLE_SERVICE_NAME=${ORACLE_SERVICE_NAME}
+      - ORACLE_HOST=${ORACLE_HOST}
+      - ORACLE_PORT=${ORACLE_PORT}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENV=${ACTIVE_ENVIRONMENT}
+      - SIDECAR_URL=${SIDECAR_URL}
+    deploy:
+      replicas: ${REPLICA_NUMBER}
+      mode: replicated
+      placement:
+        max_replicas_per_node: 1
+      update_config:
+        parallelism: 1
+        order: stop-first
+        # pause (not rollback) so a bad deploy stays visible for
+        # `docker service ps`/`logs` instead of silently reverting to the
+        # last-good image+secret — resume with `docker service update
+        # --force` (or a fixed redeploy) once the failure is diagnosed.
+        failure_action: pause
+        monitor: 30s
+        delay: 10s
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 30s
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:$${SERVER_PORT:-8180}/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  geofence-net:
+    driver: overlay
+    attachable: true
+
+secrets:
+  geofence_config:
+    external: true
+    name: ${CONFIG_SECRET:-geofence_config}
