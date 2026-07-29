@@ -61,7 +61,7 @@
               ],
               "body": {
                 "mode": "raw",
-                "raw": "{\n  \"name\": \"Downtown Parole Office\",\n  \"geo_json\": {\n    \"type\": \"Circle\",\n    \"coordinates\": [-122.4194, 37.7749],\n    \"radius\": 150,\n    \"address\": \"123 Main St, San Francisco, CA\"\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": \"{{client_id}}\",\n  \"exclude_from_colocation\": false,\n  \"notes\": \"Visiting hours 9am-5pm\"\n}"
+                "raw": "{\n  \"name\": \"Downtown Parole Office\",\n  \"geo_json\": {\n    \"type\": \"Circle\",\n    \"coordinates\": [-122.4194, 37.7749],\n    \"radius\": 150,\n    \"address\": {\n      \"name\": \"Downtown Parole Office\",\n      \"street1\": \"123 Main St\",\n      \"street2\": \"\",\n      \"city\": \"San Francisco\",\n      \"state_province_id\": 6,\n      \"state_province\": \"CA\",\n      \"state_province_name\": \"California\",\n      \"postal_code\": \"94103\",\n      \"country\": \"US\"\n    }\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": \"{{client_id}}\",\n  \"exclude_from_colocation\": false,\n  \"notes\": \"Visiting hours 9am-5pm\"\n}"
               },
               "url": {
                 "raw": "{{baseUrl}}/agencies/{{agency_id}}/geofences",
@@ -81,7 +81,7 @@
               ],
               "body": {
                 "mode": "raw",
-                "raw": "{\n  \"name\": \"Riverside District\",\n  \"geo_json\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [-122.43, 37.77],\n        [-122.41, 37.77],\n        [-122.41, 37.79],\n        [-122.43, 37.79],\n        [-122.43, 37.77]\n      ]\n    ],\n    \"address\": \"Riverside District, San Francisco, CA\"\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": null,\n  \"exclude_from_colocation\": false,\n  \"notes\": null\n}"
+                "raw": "{\n  \"name\": \"Riverside District\",\n  \"geo_json\": {\n    \"type\": \"Polygon\",\n    \"coordinates\": [\n      [\n        [-122.43, 37.77],\n        [-122.41, 37.77],\n        [-122.41, 37.79],\n        [-122.43, 37.79],\n        [-122.43, 37.77]\n      ]\n    ],\n    \"address\": {\n      \"name\": \"Riverside District\",\n      \"street1\": \"\",\n      \"street2\": \"\",\n      \"city\": \"San Francisco\",\n      \"state_province_id\": 6,\n      \"state_province\": \"CA\",\n      \"state_province_name\": \"California\",\n      \"postal_code\": \"94103\",\n      \"country\": \"US\"\n    }\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": null,\n  \"exclude_from_colocation\": false,\n  \"notes\": null\n}"
               },
               "url": {
                 "raw": "{{baseUrl}}/agencies/{{agency_id}}/geofences",
@@ -101,7 +101,7 @@
               ],
               "body": {
                 "mode": "raw",
-                "raw": "{\n  \"name\": \"Warehouse Perimeter\",\n  \"geo_json\": {\n    \"type\": \"Rectangle\",\n    \"coordinates\": [\n      [-122.42, 37.76],\n      [-122.40, 37.78]\n    ],\n    \"address\": \"Warehouse District, San Francisco, CA\"\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": \"{{client_id}}\",\n  \"exclude_from_colocation\": false,\n  \"notes\": null\n}"
+                "raw": "{\n  \"name\": \"Warehouse Perimeter\",\n  \"geo_json\": {\n    \"type\": \"Rectangle\",\n    \"coordinates\": [\n      [-122.42, 37.76],\n      [-122.40, 37.78]\n    ],\n    \"address\": {\n      \"name\": \"Warehouse District\",\n      \"street1\": \"\",\n      \"street2\": \"\",\n      \"city\": \"San Francisco\",\n      \"state_province_id\": 6,\n      \"state_province\": \"CA\",\n      \"state_province_name\": \"California\",\n      \"postal_code\": \"94124\",\n      \"country\": \"US\"\n    }\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": \"{{client_id}}\",\n  \"exclude_from_colocation\": false,\n  \"notes\": null\n}"
               },
               "url": {
                 "raw": "{{baseUrl}}/agencies/{{agency_id}}/geofences",
@@ -177,7 +177,7 @@
               ],
               "body": {
                 "mode": "raw",
-                "raw": "{\n  \"name\": \"Downtown Parole Office\",\n  \"geo_json\": {\n    \"type\": \"Circle\",\n    \"coordinates\": [-122.4194, 37.7749],\n    \"radius\": 200,\n    \"address\": \"123 Main St, San Francisco, CA\"\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": \"{{client_id}}\",\n  \"exclude_from_colocation\": false,\n  \"notes\": \"Radius widened per site review\",\n  \"version\": 1\n}"
+                "raw": "{\n  \"name\": \"Downtown Parole Office\",\n  \"geo_json\": {\n    \"type\": \"Circle\",\n    \"coordinates\": [-122.4194, 37.7749],\n    \"radius\": 200,\n    \"address\": {\n      \"name\": \"Downtown Parole Office\",\n      \"street1\": \"123 Main St\",\n      \"street2\": \"\",\n      \"city\": \"San Francisco\",\n      \"state_province_id\": 6,\n      \"state_province\": \"CA\",\n      \"state_province_name\": \"California\",\n      \"postal_code\": \"94103\",\n      \"country\": \"US\"\n    }\n  },\n  \"status\": \"active\",\n  \"user_id\": \"{{user_id}}\",\n  \"client_id\": \"{{client_id}}\",\n  \"exclude_from_colocation\": false,\n  \"notes\": \"Radius widened per site review\",\n  \"version\": 1\n}"
               },
               "url": {
                 "raw": "{{baseUrl}}/agencies/{{agency_id}}/geofences/{{geofence_id}}",

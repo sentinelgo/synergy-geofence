@@ -47,18 +47,32 @@ func StatusToDB(s string) dbmodel.GeofenceStatus {
 	return status
 }
 
+// Address mirrors components.schemas.Address, a structured physical address
+// attached to a geometry.
+type Address struct {
+	Name              string `json:"name,omitempty"`
+	Street1           string `json:"street1,omitempty"`
+	Street2           string `json:"street2,omitempty"`
+	City              string `json:"city,omitempty"`
+	StateProvinceID   int    `json:"state_province_id,omitempty"`
+	StateProvince     string `json:"state_province,omitempty"`
+	StateProvinceName string `json:"state_province_name,omitempty"`
+	PostalCode        string `json:"postal_code,omitempty"`
+	Country           string `json:"country,omitempty"`
+}
+
 // GeoJsonPoint mirrors components.schemas.GeoJsonPoint.
 type GeoJsonPoint struct {
 	Type        string        `json:"type"`
 	Coordinates spatial.Point `json:"coordinates"`
-	Address     *string       `json:"address,omitempty"`
+	Address     *Address      `json:"address,omitempty"`
 }
 
 // GeoJsonPolygon mirrors components.schemas.GeoJsonPolygon.
 type GeoJsonPolygon struct {
 	Type        string         `json:"type"`
 	Coordinates []spatial.Ring `json:"coordinates"`
-	Address     *string        `json:"address,omitempty"`
+	Address     *Address       `json:"address,omitempty"`
 }
 
 // GeoJsonRectangle extends the OpenAPI GeoJson oneOf (absent from the
@@ -70,7 +84,7 @@ type GeoJsonPolygon struct {
 type GeoJsonRectangle struct {
 	Type        string           `json:"type"`
 	Coordinates [2]spatial.Point `json:"coordinates"`
-	Address     *string          `json:"address,omitempty"`
+	Address     *Address         `json:"address,omitempty"`
 }
 
 // GeoJsonCircle mirrors components.schemas.GeoJsonCircle.
@@ -78,7 +92,7 @@ type GeoJsonCircle struct {
 	Type        string        `json:"type"`
 	Coordinates spatial.Point `json:"coordinates"`
 	Radius      float64       `json:"radius"`
-	Address     *string       `json:"address,omitempty"`
+	Address     *Address      `json:"address,omitempty"`
 }
 
 // GeoJson is a hand-rolled discriminated union over the `type` field,

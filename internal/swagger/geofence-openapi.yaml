@@ -322,6 +322,29 @@ components:
               type: string
               enum: [healthy, unhealthy]
 
+    Address:
+      type: object
+      description: Structured physical address for a geometry.
+      properties:
+        name:
+          type: string
+        street1:
+          type: string
+        street2:
+          type: string
+        city:
+          type: string
+        state_province_id:
+          type: integer
+        state_province:
+          type: string
+        state_province_name:
+          type: string
+        postal_code:
+          type: string
+        country:
+          type: string
+
     GeoJsonPoint:
       type: object
       description: GeoJSON Point geometry.
@@ -340,8 +363,7 @@ components:
           items:
             type: number
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJsonPolygon:
       type: object
@@ -367,8 +389,7 @@ components:
               items:
                 type: number
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJsonCircle:
       type: object
@@ -393,8 +414,7 @@ components:
           description: Radius in meters. Must be > 0 and ≤ configured max limit.
           exclusiveMinimum: 0
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJsonRectangle:
       type: object
@@ -418,8 +438,7 @@ components:
             items:
               type: number
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJson:
       description: GeoJSON geometry. Coordinates follow [longitude, latitude] order. Discriminate on the type field.

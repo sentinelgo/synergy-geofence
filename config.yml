@@ -31,6 +31,10 @@ common:
       ignored:
         - method: "*"
           path: "/health"
+        - method: "*"
+          path: "/swagger(/.*)?"
+        - method: "*"
+          path: "/swagger-doc\\.yaml"
       issuers:
         - issuer: https://id.${IDENTITY_DOMAIN}
           audience: ["${IDENTITY_DOMAIN}"]
@@ -45,6 +49,10 @@ common:
       unsigned-paths:
         - method: "*"
           path: "/health"
+        - method: "*"
+          path: "^/swagger(/.*)?$"
+        - method: "*"
+          path: "^/swagger-doc\\.yaml$"
       allowed-issuers:
         - https://id.${IDENTITY_DOMAIN}
         - https://user.${IDENTITY_DOMAIN}

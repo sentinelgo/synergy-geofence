@@ -12,7 +12,10 @@ import (
 	"github.com/sentinelgo/synergy-geofence/internal/database/model"
 	localerrors "github.com/sentinelgo/synergy-geofence/internal/errors"
 	events2 "github.com/sentinelgo/synergy-geofence/internal/events"
+	"github.com/sentinelgo/synergy-geofence/internal/swagger"
 	"github.com/spf13/viper"
+	swaggerfiles "github.com/swaggo/files"
+	ginswagger "github.com/swaggo/gin-swagger"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -98,6 +101,15 @@ func Execute() {
 	}
 
 	router.GET("/health", healthCheck)
+
+	// The spec is served from a path outside /swagger/*any: gin's router
+	// rejects a static path (e.g. /swagger/doc.yaml) sharing a prefix with a
+	// catch-all wildcard registered on the same segment.
+	router.GET("/swagger-doc.yaml", func(c *gin.Context) {
+		c.Data(gohttp.StatusOK, "application/yaml", swagger.OpenAPISpec)
+	})
+	router.GET("/swagger/*any", ginswagger.WrapHandler(swaggerfiles.Handler, ginswagger.URL("/swagger-doc.yaml")))
+	l.Info("swagger UI available at /swagger/index.html")
 
 	models := []interface{}{&model.Geofence{}}
 	internalAdapter, err := db.NewAdapter[uuid.UUID](context.Background(), "", models...)
