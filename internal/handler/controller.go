@@ -212,28 +212,14 @@ func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
 		return
 	}
 
-	var req hmodel.UpdateGeofenceRequest
+	var req hmodel.PatchGeofenceRequest
 	if err = c.ShouldBindJSON(&req); err != nil {
 		l.With("error", err).Error("failed to bind update geofence request")
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrBindJson, localerrors.GeofenceReq)})
 		return
 	}
 
-	entity, err := req.ToModel(agencyID, spatial.DefaultSRID)
-	if err != nil {
-		l.With("error", err).Error("failed to convert geofence request")
-		respondToModelError(c, err)
-		return
-	}
-	entity.ID = geofenceID
-	entity.Version = req.Version
-
-	// Fetched both to diff against for the UPDATED event's "changed fields
-	// only" payload, and to preserve the original creator: ToModel sets
-	// CreatedBy from the request's user_id (correct for create), but on
-	// update that field identifies who is performing *this* update, not who
-	// originally created the record.
-	existing, err := x.datasource.FindByID(c, agencyID, geofenceID)
+	entity, err := x.datasource.FindByID(c, agencyID, geofenceID)
 	if err != nil {
 		if errors.Is(err, cmodel.ErrRecordNotFound) {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrGeofenceFind, localerrors.Geofence)})
@@ -243,10 +229,23 @@ func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrGeofenceFind, localerrors.Geofence)})
 		return
 	}
-	entity.CreatedBy = existing.CreatedBy
-	entity.UpdatedBy = &req.UserID
+	original := *entity
 
-	if err = x.datasource.UpdateGeofence(c, entity); err != nil {
+	selectFields, err := req.ApplyTo(entity, spatial.DefaultSRID)
+	if err != nil {
+		l.With("error", err).Error("failed to apply geofence patch")
+		respondToModelError(c, err)
+		return
+	}
+	entity.UpdatedBy = &req.UserID
+	selectFields = append(selectFields, "updated_by")
+
+	// The WHERE clause compares against the client's claimed version, not
+	// entity's just-fetched (and therefore always-current) one — otherwise
+	// the optimistic-concurrency check could never fail.
+	entity.Version = req.Version
+
+	if err = x.datasource.UpdateGeofence(c, entity, selectFields...); err != nil {
 		if errors.Is(err, cmodel.ErrOptimisticLock) {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrOptimisticLock, localerrors.Geofence)})
 			return
@@ -277,7 +276,7 @@ func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
 		AgencyID:   entity.AgencyID,
 		UserID:     req.UserID,
 		Timestamp:  time.Now().UTC(),
-		Payload:    hmodel.DiffChangedFields(existing, entity),
+		Payload:    hmodel.DiffChangedFields(&original, entity),
 	})
 
 	c.JSON(http.StatusOK, gin.H{pkg.Code: http.StatusOK, pkg.Message: "geofence updated successfully", pkg.Type: pkg.SuccessKey, pkg.DataKey: resp})

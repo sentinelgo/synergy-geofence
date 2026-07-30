@@ -161,7 +161,7 @@ func Execute() {
 		GET("", requireAgencyViewer, gc.ListGeofences).
 		GET("/lookup", requireAgencyViewer, gc.LookupGeofences).
 		GET("/:geofence_id", requireAgencyViewer, gc.GetGeofence).
-		PUT("/:geofence_id", requireAgencyAdmin, gc.UpdateGeofence).
+		PATCH("/:geofence_id", requireAgencyAdmin, gc.UpdateGeofence).
 		DELETE("/:geofence_id", requireAgencyAdmin, gc.DeleteGeofence)
 
 	l.With("version", fmt.Sprintf("v%s", cfg.Version)).Info("geofence service ready")
