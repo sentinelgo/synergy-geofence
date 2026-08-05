@@ -116,6 +116,7 @@
             "request": {
               "method": "GET",
               "header": [
+
                 { "key": "x-correlation-id", "value": "{{correlation_id}}" }
               ],
               "url": {
@@ -168,9 +169,30 @@
             "response": []
           },
           {
-            "name": "Update Geofence",
+            "name": "Update Geofence (partial - notes only)",
             "request": {
-              "method": "PUT",
+              "method": "PATCH",
+              "header": [
+                { "key": "Content-Type", "value": "application/json" },
+                { "key": "x-correlation-id", "value": "{{correlation_id}}" }
+              ],
+              "body": {
+                "mode": "raw",
+                "raw": "{\n  \"notes\": \"Radius widened per site review\",\n  \"user_id\": \"{{user_id}}\",\n  \"version\": 1\n}"
+              },
+              "url": {
+                "raw": "{{baseUrl}}/agencies/{{agency_id}}/geofences/{{geofence_id}}",
+                "host": ["{{baseUrl}}"],
+                "path": ["agencies", "{{agency_id}}", "geofences", "{{geofence_id}}"]
+              },
+              "description": "PATCH only requires user_id and version; every other field is optional and, if omitted, keeps its current value. Fields shown below (client_id, notes) may be explicitly set to null to clear them."
+            },
+            "response": []
+          },
+          {
+            "name": "Update Geofence (full replacement)",
+            "request": {
+              "method": "PATCH",
               "header": [
                 { "key": "Content-Type", "value": "application/json" },
                 { "key": "x-correlation-id", "value": "{{correlation_id}}" }
