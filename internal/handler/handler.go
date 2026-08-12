@@ -22,11 +22,9 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
 
-	auth "github.com/sentinelgo/synergy-common/pkg/authz/resolver"
 	"github.com/sentinelgo/synergy-common/pkg/config"
 	db "github.com/sentinelgo/synergy-common/pkg/database"
 	"github.com/sentinelgo/synergy-common/pkg/database/migration"
-	"github.com/sentinelgo/synergy-common/pkg/http"
 	"github.com/sentinelgo/synergy-common/pkg/http/token"
 	"github.com/sentinelgo/synergy-common/pkg/log"
 	"github.com/sentinelgo/synergy-common/pkg/otelx"
@@ -63,15 +61,6 @@ func Execute() {
 			viper.Set("common.jwt.subject", "")
 		}
 	}
-
-	client := &gohttp.Client{}
-	if cfg.Common.Signing.HasSigning() {
-		client = http.NewSigningClient(router, cfg.Common.Signing.Client.Issuer, cfg.Common.Signing.Client.Keys...)
-		l.Info("http message signing enabled")
-	} else {
-		l.Info("http message signing disabled")
-	}
-	authzClient := auth.NewAuthzClient(client, cfg)
 
 	// gin.Recovery() first so a panicking handler still gets a JSON 500
 	// response and a logged stack trace instead of crashing the process.
@@ -147,7 +136,7 @@ func Execute() {
 
 	gc := NewGeofenceController(gdbc, cfg, publisher)
 
-	claimsMiddleware := claimsValidationMiddleware(authzClient)
+	claimsMiddleware := claimsValidationMiddleware()
 
 	v1 := router.Group("/api/v1")
 	agencyGeofences := v1.Group("/agencies/:agency_id/geofences")
@@ -155,7 +144,6 @@ func Execute() {
 
 	// Known Locations Management is admin-only: Agency Admin, System
 	// Administrator or Global Administrator may create/update/delete;
-	// Read-Only Administrators may additionally view (see auth.go).
 	agencyGeofences.
 		POST("", requireAgencyAdmin, gc.CreateGeofence).
 		GET("", requireAgencyViewer, gc.ListGeofences).
@@ -176,8 +164,7 @@ func healthCheck(c *gin.Context) {
 }
 
 // withAgencyId parses the :agency_id path parameter shared by every
-// geofence route into a UUID and stores it on the gin context, mirroring
-// sso-agency-service's own withAgencyId middleware.
+// geofence route into a UUID and stores it on the gin context
 func withAgencyId(c *gin.Context) {
 	ctx, span := otelx.StartTracer(gincommon.UnwrapContext(c))
 	defer otelx.End(span, nil)

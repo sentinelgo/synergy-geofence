@@ -2,122 +2,77 @@ package handler
 
 import (
 	"net/http"
-	"time"
 
-	jwtmiddleware "github.com/auth0/go-jwt-middleware/v3"
 	"github.com/auth0/go-jwt-middleware/v3/validator"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	pkg "github.com/sentinelgo/synergy-geofence/internal"
 	localerrors "github.com/sentinelgo/synergy-geofence/internal/errors"
 
-	"github.com/sentinelgo/synergy-common/pkg/authz/api/model/enums/roleenum"
+	"github.com/sentinelgo/synergy-common/pkg/authz/api"
 	auth "github.com/sentinelgo/synergy-common/pkg/authz/resolver"
+	jwtpkg "github.com/sentinelgo/synergy-common/pkg/http/jwt"
 	"github.com/sentinelgo/synergy-common/pkg/http/token"
 	"github.com/sentinelgo/synergy-common/pkg/log"
 	"github.com/spf13/viper"
 )
 
-// claimsValidationMiddleware resolves the caller's JWT/role claims (if any)
-// once per request and stashes them on the gin context, mirroring
-// sso-agency-service's own claimsValidationMiddleware. It never aborts the
+// claimsValidationMiddleware resolves the caller's JWT claims (if any) once
+// per request and stashes them on the gin context. It never aborts the
 // request itself — routes that require an authenticated/authorized caller
 // enforce that via requireAgencyAdmin/requireAgencyViewer.
-func claimsValidationMiddleware(authzClient auth.AuthzClient) gin.HandlerFunc {
+func claimsValidationMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if sc := claimsFromContext(c, authzClient); sc != nil {
+		if sc := claimsFromContext(c); sc != nil {
 			c.Set(pkg.ClaimsKey(), sc)
 		}
 		c.Next()
 	}
 }
 
-// claimsFromContext extracts and validates the caller's identity from the
-// incoming request, in priority order: claims already resolved earlier in
-// the chain, claims attached by the token verification middleware, claims
-// attached by the auth0 JWT middleware, a local-development subject override
-// (viper "common.jwt.subject"), and finally a service-to-service fallback for
-// signed-but-unauthenticated (m2m) requests. Returns nil if none apply,
+// claimsFromContext resolves the caller's identity from the claims attached
+// by the token verification middleware. This service has no authz sidecar to
+// consult, so requireAgencyAdmin/requireAgencyViewer/isAgencyAdmin resolve
+// role/agency data entirely from the JWT's own custom ("meta") claims below —
+// nothing here makes a network call. Returns nil if no claims are present,
 // which happens whenever JWT verification is disabled for this environment.
-func claimsFromContext(c *gin.Context, authClient auth.AuthzClient) *auth.Jwt {
+func claimsFromContext(c *gin.Context) *auth.Jwt {
 	l := log.LoggerFromContext(c)
 
-	if authJwt := pkg.Claims(c); authJwt != nil {
-		return authJwt
+	tclaims, ok := token.ClaimsFromContext(c.Request.Context())
+	if !ok || tclaims == nil {
+		return nil
 	}
 
-	if tclaims, ok := token.ClaimsFromContext(c.Request.Context()); ok && tclaims != nil {
-		if claims, ok := tclaims.Raw.(*validator.ValidatedClaims); ok && claims != nil {
-			l.With(pkg.ClaimsKey(), claims).Debug("incoming claims")
-			if authJwt, err := populateAuthJwtFromValidatedClaims(c, authClient, claims); err != nil {
-				l.With(pkg.ErrorKey, err).Error("unable to list user roles with this claim")
-			} else {
-				return authJwt
-			}
-		} else if len(tclaims.Subject) > 0 {
-			claims := &validator.ValidatedClaims{
-				RegisteredClaims: validator.RegisteredClaims{
-					Issuer:   tclaims.Issuer,
-					Subject:  tclaims.Subject,
-					Audience: tclaims.Aud,
-				},
-			}
-			l.With(pkg.ClaimsKey(), tclaims).Debug("incoming token claims")
-			if authJwt, err := populateAuthJwtFromValidatedClaims(c, authClient, claims); err != nil {
-				l.With(pkg.ErrorKey, err).Error("unable to list user roles with this claim")
-			} else {
-				return authJwt
-			}
-		}
-	}
-
-	if claims, err := jwtmiddleware.GetClaims[*validator.ValidatedClaims](c.Request.Context()); err == nil {
-		l.With(pkg.ClaimsKey(), claims).Debug("incoming claims")
-		if authJwt, perr := populateAuthJwtFromValidatedClaims(c, authClient, claims); perr != nil {
-			l.With(pkg.ErrorKey, perr).Error("unable to list user roles with this claim")
-		} else {
-			return authJwt
-		}
-	}
-
-	if viper.GetString("common.jwt.subject") != "" {
-		claims := &validator.ValidatedClaims{
+	claims, ok := tclaims.Raw.(*validator.ValidatedClaims)
+	if !ok || claims == nil {
+		claims = &validator.ValidatedClaims{
 			RegisteredClaims: validator.RegisteredClaims{
-				Issuer:   viper.GetString("common.jwt.issuer"),
-				Subject:  viper.GetString("common.jwt.subject"),
-				Audience: viper.GetStringSlice("common.jwt.audience"),
-				Expiry:   time.Now().Add(5 * time.Hour).UnixMilli(),
-				ID:       uuid.NewString(),
+				Issuer:   tclaims.Issuer,
+				Subject:  tclaims.Subject,
+				Audience: tclaims.Aud,
 			},
 		}
-		if authJwt, err := populateAuthJwtFromValidatedClaims(c, authClient, claims); err != nil {
-			l.With(pkg.ErrorKey, err).Error("unable to list user roles with this claim")
-		} else {
-			return authJwt
-		}
 	}
 
-	if authJwt, err := auth.PopulateServiceToServiceClaims(c, nil); err != nil {
-		l.With(pkg.ErrorKey, err).Error("unable to create a service to service claim")
-	} else if authJwt != nil {
-		l.With(pkg.ClaimsKey(), authJwt).Debug("created a service to service claim")
-		return authJwt
-	}
-
-	return nil
+	l.With(pkg.ClaimsKey(), claims).Debug("incoming claims")
+	return auth.NewJwt(claims, nil)
 }
 
-func populateAuthJwtFromValidatedClaims(c *gin.Context, authClient auth.AuthzClient, claims *validator.ValidatedClaims) (*auth.Jwt, error) {
-	if claims.CustomClaims != nil {
-		return authClient.PopulateRolesFromClaims(c, claims)
+// serviceClaims safely extracts the JWT's ServiceClaims — the "meta"/"scope"
+// custom claims carrying the caller's sentinel and per-agency role
+// assignments, embedded directly in the token at issuance — or nil if the
+// caller's claims don't carry any (e.g. a token with no custom claims at
+// all).
+func serviceClaims(sc *auth.Jwt) *jwtpkg.ServiceClaims {
+	if sc == nil {
+		return nil
 	}
-
-	roles, err := authClient.ListUserRoles(c, claims.RegisteredClaims.Subject)
-	if err != nil {
-		return nil, err
+	svc, ok := sc.CustomClaims.(*jwtpkg.ServiceClaims)
+	if !ok {
+		return nil
 	}
-
-	return auth.NewJwt(claims, roles[claims.RegisteredClaims.Subject]), nil
+	return svc
 }
 
 // Known Locations Management is admin-only: "Menu item shall be visible
@@ -132,9 +87,10 @@ func populateAuthJwtFromValidatedClaims(c *gin.Context, authClient auth.AuthzCli
 // Agency Admin role at the target agency. It must run after withAgencyId
 // and claimsValidationMiddleware.
 func requireAgencyAdmin(c *gin.Context) {
-	// No real IDP (and no reachable authz sidecar) in an environment that
-	// disables JWT verification, so there's no legitimate way to resolve a
-	// caller's actual role here. Skip the gate rather than reject everyone.
+	// No real IDP (and no authz sidecar exists for this service) in an
+	// environment that disables JWT verification, so there's no legitimate
+	// way to resolve a caller's actual role here. Skip the gate rather than
+	// reject everyone.
 	if viper.GetBool("common.jwt.verification.disabled") {
 		c.Next()
 		return
@@ -146,12 +102,18 @@ func requireAgencyAdmin(c *gin.Context) {
 		return
 	}
 
-	if sc.IsGlobalAdmin() || sc.IsSystemAdmin() {
+	svc := serviceClaims(sc)
+	if svc == nil {
+		abortForbidden(c, sc, pkg.AgencyID(c))
+		return
+	}
+
+	if svc.IsGlobalAdmin() || svc.IsSystemAdmin() {
 		c.Next()
 		return
 	}
 
-	if isAgencyAdmin(sc, pkg.AgencyID(c)) {
+	if isAgencyAdmin(svc, pkg.AgencyID(c)) {
 		c.Next()
 		return
 	}
@@ -175,12 +137,18 @@ func requireAgencyViewer(c *gin.Context) {
 		return
 	}
 
-	if sc.IsGlobalAdmin() || sc.IsSystemAdmin() || sc.IsReadOnlyAdmin() {
+	svc := serviceClaims(sc)
+	if svc == nil {
+		abortForbidden(c, sc, pkg.AgencyID(c))
+		return
+	}
+
+	if svc.IsGlobalAdmin() || svc.IsSystemAdmin() || svc.IsReadOnlyAdmin() {
 		c.Next()
 		return
 	}
 
-	if isAgencyAdmin(sc, pkg.AgencyID(c)) {
+	if isAgencyAdmin(svc, pkg.AgencyID(c)) {
 		c.Next()
 		return
 	}
@@ -191,15 +159,10 @@ func requireAgencyViewer(c *gin.Context) {
 // isAgencyAdmin reports whether the claims hold the Agency Admin role at
 // the given agency specifically (not a sentinel role, and not merely any
 // role at the agency — Manager/Operator/Standard/Limited/ReadOnly are all
-// "Non-Admin" for this purpose).
-func isAgencyAdmin(sc *auth.Jwt, agencyID uuid.UUID) bool {
-	id, ok := sc.HasAssociationWith(agencyID.String())
-	if !ok || id == nil {
-		return false
-	}
-
-	tid, err := roleenum.TemplateIdString(id.Template)
-	return err == nil && tid == roleenum.AgencyAdmin
+// "Non-Admin" for this purpose), as embedded directly in the JWT's own
+// claims.
+func isAgencyAdmin(svc *jwtpkg.ServiceClaims, agencyID uuid.UUID) bool {
+	return svc.MetadataPublic.HasRole(agencyID.String(), api.AgencyAdmin, nil)
 }
 
 func abortUnauthorized(c *gin.Context) {
