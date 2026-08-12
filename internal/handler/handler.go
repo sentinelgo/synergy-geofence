@@ -70,6 +70,14 @@ func Execute() {
 
 	jwtCfg := cfg.Common.Jwt.Verification
 	signingCfg := cfg.Common.Signing.Verification
+	geofenceAuth, geofenceAuthErr := geofenceAuthorizationConfigFromViper()
+	if geofenceAuthErr != nil {
+		l.With("error", geofenceAuthErr).Error("could not initialize geofence authorization")
+		panic(geofenceAuthErr)
+	}
+	if geofenceAuth.Enabled {
+		router.Use(hydrateOpaqueGeofenceClaims(geofenceAuth, nil))
+	}
 	jwtEnabled := !jwtCfg.Disabled && (len(jwtCfg.Issuers) > 0 || jwtCfg.Machine.Hydra != nil)
 	signingEnabled := !signingCfg.Disabled
 	if jwtEnabled || signingEnabled {
@@ -88,7 +96,6 @@ func Execute() {
 	} else {
 		l.Warn("authorization token verification is disabled")
 	}
-
 	router.GET("/health", healthCheck)
 
 	// The spec is served from a path outside /swagger/*any: gin's router

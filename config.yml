@@ -22,6 +22,10 @@ common:
       enabled: false
   sidecar:
     base-url: ${SIDECAR_URL}
+  geofence:
+    enabled: ${GEOFENCE_AUTH_ENABLED}
+    audience: ${GEOFENCE_AUTH_AUDIENCE}
+    userinfo-url: ${HYDRA_USERINFO_URL}
   jwt:
     verification:
       # Per environment: true where no real IDP is reachable (local/dev);

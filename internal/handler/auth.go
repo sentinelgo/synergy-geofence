@@ -1,7 +1,11 @@
 package handler
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/auth0/go-jwt-middleware/v3/validator"
 	"github.com/gin-gonic/gin"
@@ -10,6 +14,7 @@ import (
 	localerrors "github.com/sentinelgo/synergy-geofence/internal/errors"
 
 	"github.com/sentinelgo/synergy-common/pkg/authz/api"
+	"github.com/sentinelgo/synergy-common/pkg/authz/api/model/metadata"
 	auth "github.com/sentinelgo/synergy-common/pkg/authz/resolver"
 	jwtpkg "github.com/sentinelgo/synergy-common/pkg/http/jwt"
 	"github.com/sentinelgo/synergy-common/pkg/http/token"
@@ -17,7 +22,108 @@ import (
 	"github.com/spf13/viper"
 )
 
-// claimsValidationMiddleware resolves the caller's JWT claims (if any) once
+type geofenceAuthorizationConfig struct {
+	Enabled     bool   `mapstructure:"enabled"`
+	Audience    string `mapstructure:"audience"`
+	UserinfoURL string `mapstructure:"userinfo-url"`
+}
+
+type geofenceUserinfo struct {
+	Subject  string                   `json:"sub"`
+	Audience []string                 `json:"aud"`
+	Meta     *metadata.MetadataPublic `json:"meta"`
+	TokenUse string                   `json:"token_use"`
+}
+
+func geofenceAuthorizationConfigFromViper() (geofenceAuthorizationConfig, error) {
+	var cfg geofenceAuthorizationConfig
+	if err := viper.UnmarshalKey("common.geofence", &cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.Enabled && (cfg.Audience == "" || cfg.UserinfoURL == "") {
+		return cfg, fmt.Errorf("enabled geofence authorization requires audience and userinfo-url")
+	}
+	return cfg, nil
+}
+
+// hydrateOpaqueGeofenceClaims validates opaque portal tokens through Hydra's
+// public /userinfo endpoint. It runs before the shared JWT middleware because
+// /userinfo performs opaque-token introspection internally.
+func hydrateOpaqueGeofenceClaims(cfg geofenceAuthorizationConfig, client *http.Client) gin.HandlerFunc {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return func(c *gin.Context) {
+		if !cfg.Enabled || !strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.Next()
+			return
+		}
+
+		authorization := c.GetHeader("Authorization")
+		parts := strings.Fields(authorization)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			c.Next()
+			return
+		}
+		if strings.Count(parts[1], ".") == 2 {
+			// JWT requests retain the existing validation path. The portal path is
+			// the opaque-token path and is hydrated below.
+			c.Next()
+			return
+		}
+		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, cfg.UserinfoURL, nil)
+		if err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Authorization", authorization)
+		response, err := client.Do(req)
+		if err != nil {
+			log.LoggerFromContext(c).With("error", err).Error("could not hydrate geofence claims from userinfo")
+			c.AbortWithStatus(http.StatusBadGateway)
+			return
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+
+		var userinfo geofenceUserinfo
+		if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&userinfo); err != nil ||
+			userinfo.Subject == "" || userinfo.TokenUse != "geofence" ||
+			!geofenceAudience(userinfo.Audience, cfg.Audience) ||
+			userinfo.Meta == nil || userinfo.Meta.UserProfile == nil {
+			log.LoggerFromContext(c).With("error", err).Warn("userinfo returned invalid geofence claims")
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+
+		serviceClaims := jwtpkg.NewServiceClaimsWithMetadata(userinfo.Meta)
+		validated := &validator.ValidatedClaims{
+			CustomClaims: serviceClaims,
+			RegisteredClaims: validator.RegisteredClaims{
+				Subject:  userinfo.Subject,
+				Audience: append([]string(nil), userinfo.Audience...),
+			},
+		}
+		claims := &token.Claims{
+			Subject: userinfo.Subject,
+			Aud:     append([]string(nil), userinfo.Audience...),
+			Extras:  map[string]any{"meta": userinfo.Meta.ToCompatible(), "token_use": userinfo.TokenUse},
+			Raw:     validated,
+		}
+		c.Request = c.Request.WithContext(token.WithClaims(c.Request.Context(), claims))
+		c.Request.Header.Del("Authorization")
+		c.Next()
+	}
+}
+
+func geofenceAudience(actual []string, resourceAudience string) bool {
+	return len(actual) == 1 && actual[0] == resourceAudience
+}
+
+// claimsValidationMiddleware resolves the caller's validated claims (if any) once
 // per request and stashes them on the gin context. It never aborts the
 // request itself — routes that require an authenticated/authorized caller
 // enforce that via requireAgencyAdmin/requireAgencyViewer.
@@ -31,11 +137,10 @@ func claimsValidationMiddleware() gin.HandlerFunc {
 }
 
 // claimsFromContext resolves the caller's identity from the claims attached
-// by the token verification middleware. This service has no authz sidecar to
-// consult, so requireAgencyAdmin/requireAgencyViewer/isAgencyAdmin resolve
-// role/agency data entirely from the JWT's own custom ("meta") claims below —
-// nothing here makes a network call. Returns nil if no claims are present,
-// which happens whenever JWT verification is disabled for this environment.
+// by the token verification middleware. JWT claims arrive directly from the
+// validator; opaque portal-token claims have already been augmented from
+// Hydra /userinfo by hydrateOpaqueGeofenceClaims. This function itself makes
+// no network call. It returns nil if no claims are present.
 func claimsFromContext(c *gin.Context) *auth.Jwt {
 	l := log.LoggerFromContext(c)
 
@@ -59,11 +164,9 @@ func claimsFromContext(c *gin.Context) *auth.Jwt {
 	return auth.NewJwt(claims, nil)
 }
 
-// serviceClaims safely extracts the JWT's ServiceClaims — the "meta"/"scope"
-// custom claims carrying the caller's sentinel and per-agency role
-// assignments, embedded directly in the token at issuance — or nil if the
-// caller's claims don't carry any (e.g. a token with no custom claims at
-// all).
+// serviceClaims safely extracts ServiceClaims — the stable "meta"/"scope"
+// contract carrying the caller's sentinel and per-agency role assignments.
+// These are decoded from a JWT or hydrated from /userinfo for an opaque token.
 func serviceClaims(sc *auth.Jwt) *jwtpkg.ServiceClaims {
 	if sc == nil {
 		return nil
