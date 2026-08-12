@@ -29,10 +29,11 @@ type geofenceAuthorizationConfig struct {
 }
 
 type geofenceUserinfo struct {
-	Subject  string                   `json:"sub"`
-	Audience []string                 `json:"aud"`
-	Meta     *metadata.MetadataPublic `json:"meta"`
-	TokenUse string                   `json:"token_use"`
+	Subject         string                   `json:"sub"`
+	HydratedSubject string                   `json:"subject"`
+	Audience        []string                 `json:"aud"`
+	Meta            *metadata.MetadataPublic `json:"meta"`
+	TokenUse        string                   `json:"token_use"`
 }
 
 func geofenceAuthorizationConfigFromViper() (geofenceAuthorizationConfig, error) {
@@ -90,11 +91,22 @@ func hydrateOpaqueGeofenceClaims(cfg geofenceAuthorizationConfig, client *http.C
 		}
 
 		var userinfo geofenceUserinfo
-		if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&userinfo); err != nil ||
-			userinfo.Subject == "" || userinfo.TokenUse != "geofence" ||
+		if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&userinfo); err != nil {
+			log.LoggerFromContext(c).With("error", err).Warn("userinfo returned invalid geofence claims")
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		subject := userinfo.Subject
+		if subject == "" {
+			// Hydra 2.2 does not copy the JWT-bearer session subject into the
+			// ID-token claims serialized by /userinfo. Its token hook cannot set
+			// reserved claims, so sidecar supplies this bounded compatibility claim.
+			subject = userinfo.HydratedSubject
+		}
+		if subject == "" || userinfo.TokenUse != "geofence" ||
 			!geofenceAudience(userinfo.Audience, cfg.Audience) ||
 			userinfo.Meta == nil || userinfo.Meta.UserProfile == nil {
-			log.LoggerFromContext(c).With("error", err).Warn("userinfo returned invalid geofence claims")
+			log.LoggerFromContext(c).Warn("userinfo returned invalid geofence claims")
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
@@ -103,12 +115,12 @@ func hydrateOpaqueGeofenceClaims(cfg geofenceAuthorizationConfig, client *http.C
 		validated := &validator.ValidatedClaims{
 			CustomClaims: serviceClaims,
 			RegisteredClaims: validator.RegisteredClaims{
-				Subject:  userinfo.Subject,
+				Subject:  subject,
 				Audience: append([]string(nil), userinfo.Audience...),
 			},
 		}
 		claims := &token.Claims{
-			Subject: userinfo.Subject,
+			Subject: subject,
 			Aud:     append([]string(nil), userinfo.Audience...),
 			Extras:  map[string]any{"meta": userinfo.Meta.ToCompatible(), "token_use": userinfo.TokenUse},
 			Raw:     validated,

@@ -65,6 +65,43 @@ func TestHydrateOpaqueGeofenceClaimsUsesUserinfoMeta(t *testing.T) {
 	}
 }
 
+func TestHydrateOpaqueGeofenceClaimsUsesHydratedSubjectFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	md := metadata.NewMetadataPublic()
+	userinfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"subject":   "user-id",
+			"aud":       []string{"geofence.dev.sentinelsyn.com"},
+			"meta":      md.ToCompatible(),
+			"token_use": "geofence",
+		})
+	}))
+	defer userinfo.Close()
+
+	router := gin.New()
+	router.Use(hydrateOpaqueGeofenceClaims(geofenceAuthorizationConfig{
+		Enabled:     true,
+		Audience:    "geofence.dev.sentinelsyn.com",
+		UserinfoURL: userinfo.URL,
+	}, userinfo.Client()))
+	router.GET("/api/v1/test", func(c *gin.Context) {
+		claims, ok := token.ClaimsFromContext(c.Request.Context())
+		if !ok || claims.Subject != "user-id" {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil)
+	request.Header.Set("Authorization", "Bearer ory_at_test")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("response status = %d, want %d; body=%s", response.Code, http.StatusNoContent, response.Body.String())
+	}
+}
+
 func TestHydrateOpaqueGeofenceClaimsRejectsWrongAudience(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	md := metadata.NewMetadataPublic()
