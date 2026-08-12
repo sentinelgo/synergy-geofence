@@ -146,8 +146,7 @@ func Execute() {
 	// Administrator or Global Administrator may create/update/delete;
 	agencyGeofences.
 		POST("", requireAgencyAdmin, gc.CreateGeofence).
-		GET("", requireAgencyViewer, gc.ListGeofences).
-		GET("/lookup", requireAgencyViewer, gc.LookupGeofences).
+		Handle("LIST", "", requireAgencyViewer, gc.ListGeofences).
 		GET("/:geofence_id", requireAgencyViewer, gc.GetGeofence).
 		PATCH("/:geofence_id", requireAgencyAdmin, gc.UpdateGeofence).
 		DELETE("/:geofence_id", requireAgencyAdmin, gc.DeleteGeofence)
