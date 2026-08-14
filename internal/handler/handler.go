@@ -146,6 +146,7 @@ func Execute() {
 	claimsMiddleware := claimsValidationMiddleware()
 
 	v1 := router.Group("/api/v1")
+	v1.GET("/health", healthCheck)
 	agencyGeofences := v1.Group("/agencies/:agency_id/geofences")
 	agencyGeofences.Use(withAgencyId, claimsMiddleware)
 
