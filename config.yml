@@ -18,8 +18,9 @@ common:
         varcharsizeischarlength: true
         namingcasesensitive: true
         sessiontimezone: UTC
-    migration:
-      enabled: false
+    # Schema is owned by the DBA (see db/schema/*.sql) — this service never
+    # migrates the database itself, so migration.enabled is intentionally
+    # left unset rather than wired up here.
   sidecar:
     base-url: ${SIDECAR_URL}
   geofence:

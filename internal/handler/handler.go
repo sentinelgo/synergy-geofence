@@ -24,13 +24,10 @@ import (
 
 	"github.com/sentinelgo/synergy-common/pkg/config"
 	db "github.com/sentinelgo/synergy-common/pkg/database"
-	"github.com/sentinelgo/synergy-common/pkg/database/migration"
 	"github.com/sentinelgo/synergy-common/pkg/http/token"
 	"github.com/sentinelgo/synergy-common/pkg/log"
 	"github.com/sentinelgo/synergy-common/pkg/otelx"
 	gincommon "github.com/sentinelgo/synergy-common/pkg/otelx/gin"
-
-	_ "github.com/sentinelgo/synergy-geofence/internal/db"
 )
 
 func Execute() {
@@ -123,11 +120,6 @@ func Execute() {
 
 	dbc.DB().Config.Logger = log.AsGormLogger(log.Default(), gormlogger.Silent)
 	_ = dbc.DB().Use(tracing.NewPlugin(tracing.WithoutMetrics(), tracing.WithTracerProvider(otel.GetTracerProvider())))
-
-	if err = migration.Migrate(dbc.DB()); err != nil {
-		l.With("error", err).Error("could not validate database")
-		panic(err)
-	}
 
 	var publisher events2.Publisher = events2.NoopPublisher{}
 	if eventsCfg, eerr := config.FromViper[events2.Config](); eerr != nil {
