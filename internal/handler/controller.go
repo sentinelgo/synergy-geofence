@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	pkg "github.com/sentinelgo/synergy-geofence/internal"
+	"github.com/sentinelgo/synergy-geofence/internal/audit"
 	"github.com/sentinelgo/synergy-geofence/internal/database"
 	dbmodel "github.com/sentinelgo/synergy-geofence/internal/database/model"
 	"github.com/sentinelgo/synergy-geofence/internal/database/spatial"
@@ -16,6 +17,7 @@ import (
 	"github.com/sentinelgo/synergy-geofence/internal/events"
 	hmodel "github.com/sentinelgo/synergy-geofence/internal/handler/model"
 
+	activitylogger "github.com/sentinelgo/synergy-common/pkg/activity-logger"
 	"github.com/sentinelgo/synergy-common/pkg/config"
 	cmodel "github.com/sentinelgo/synergy-common/pkg/database/model"
 	"github.com/sentinelgo/synergy-common/pkg/log"
@@ -30,13 +32,14 @@ const (
 )
 
 type GeofenceController struct {
-	datasource database.GeofenceDbAdapter
-	cfg        *config.Config
-	publisher  events.Publisher
+	datasource  database.GeofenceDbAdapter
+	cfg         *config.Config
+	publisher   events.Publisher
+	activityLog activitylogger.Logger
 }
 
-func NewGeofenceController(datasource database.GeofenceDbAdapter, cfg *config.Config, publisher events.Publisher) *GeofenceController {
-	return &GeofenceController{datasource: datasource, cfg: cfg, publisher: publisher}
+func NewGeofenceController(datasource database.GeofenceDbAdapter, cfg *config.Config, publisher events.Publisher, activityLog activitylogger.Logger) *GeofenceController {
+	return &GeofenceController{datasource: datasource, cfg: cfg, publisher: publisher, activityLog: activityLog}
 }
 
 func (x *GeofenceController) CreateGeofence(c *gin.Context) {
@@ -88,6 +91,11 @@ func (x *GeofenceController) CreateGeofence(c *gin.Context) {
 		Timestamp:  time.Now().UTC(),
 		Payload:    resp,
 	})
+	audit.LogGeofenceCreated(c, x.activityLog,
+		audit.Actor{UserID: entity.CreatedBy, IP: c.ClientIP()},
+		audit.Resource{ID: entity.ID, Name: entity.Name, AgencyID: entity.AgencyID},
+		resp,
+	)
 
 	c.JSON(http.StatusCreated, gin.H{pkg.Code: http.StatusCreated, pkg.Message: "geofence created successfully", pkg.Type: pkg.SuccessKey, pkg.DataKey: resp})
 }
@@ -270,14 +278,20 @@ func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
 		return
 	}
 
+	diff := hmodel.DiffChangedFields(&original, entity)
 	x.publisher.Publish(c, events.Event{
 		EventType:  events.EventTypeUpdated,
 		GeofenceID: entity.ID,
 		AgencyID:   entity.AgencyID,
 		UserID:     req.UserID,
 		Timestamp:  time.Now().UTC(),
-		Payload:    hmodel.DiffChangedFields(&original, entity),
+		Payload:    diff,
 	})
+	audit.LogGeofenceUpdated(c, x.activityLog,
+		audit.Actor{UserID: req.UserID, IP: c.ClientIP()},
+		audit.Resource{ID: entity.ID, Name: entity.Name, AgencyID: entity.AgencyID},
+		diff,
+	)
 
 	c.JSON(http.StatusOK, gin.H{pkg.Code: http.StatusOK, pkg.Message: "geofence updated successfully", pkg.Type: pkg.SuccessKey, pkg.DataKey: resp})
 }
@@ -328,6 +342,13 @@ func (x *GeofenceController) DeleteGeofence(c *gin.Context) {
 		UserID:     userID,
 		Timestamp:  time.Now().UTC(),
 	})
+	// No display name here: unlike Create/Update, this handler never loads
+	// the geofence row (DeleteGeofence deletes by id directly), so
+	// Resource.Name is left empty — an acceptable gap for an optional field.
+	audit.LogGeofenceDeleted(c, x.activityLog,
+		audit.Actor{UserID: userID, IP: c.ClientIP()},
+		audit.Resource{ID: geofenceID, AgencyID: agencyID},
+	)
 
 	c.JSON(http.StatusOK, gin.H{pkg.Code: http.StatusOK, pkg.Message: "geofence deleted successfully", pkg.Type: pkg.SuccessKey})
 }

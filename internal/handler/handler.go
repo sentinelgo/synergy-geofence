@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	pkg "github.com/sentinelgo/synergy-geofence/internal"
+	"github.com/sentinelgo/synergy-geofence/internal/audit"
 	"github.com/sentinelgo/synergy-geofence/internal/database"
 	"github.com/sentinelgo/synergy-geofence/internal/database/model"
 	localerrors "github.com/sentinelgo/synergy-geofence/internal/errors"
@@ -133,7 +134,14 @@ func Execute() {
 		}
 	}
 
-	gc := NewGeofenceController(gdbc, cfg, publisher)
+	auditCfg, auditCfgErr := audit.ConfigFromViper()
+	if auditCfgErr != nil {
+		l.With("error", auditCfgErr).Warn("could not load activity-log config, geofence audit events will not be recorded")
+	}
+	activityLog := audit.NewLogger(auditCfg, l)
+	defer activityLog.Close()
+
+	gc := NewGeofenceController(gdbc, cfg, publisher, activityLog)
 
 	claimsMiddleware := claimsValidationMiddleware()
 
