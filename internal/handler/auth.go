@@ -190,6 +190,35 @@ func serviceClaims(sc *auth.Jwt) *jwtpkg.ServiceClaims {
 	return svc
 }
 
+// authenticatedUserID resolves the caller's own identity — the validated
+// JWT/opaque-token subject — for audit attribution. requireAgencyAdmin only
+// verifies the caller holds an admin role at the target agency; it never
+// checks that a request's client-supplied user_id (entity.CreatedBy,
+// req.UserID, DeleteGeofence's user_id query param — see its doc comment)
+// actually matches whoever is authenticated. Those fields are left as-is
+// for the business record and the Pulsar lifecycle events, an accepted
+// tradeoff there, but an audit trail's whole point is "who did this," so
+// its Actor should be built from this instead wherever it's available.
+//
+// Returns ok=false — callers should fall back to the client-supplied id —
+// when there's no authenticated subject at all (e.g.
+// common.jwt.verification.disabled, the same dev-only bypass documented on
+// requireAgencyAdmin: there's no legitimate identity to resolve there
+// either) or the subject claim isn't a well-formed UUID.
+func authenticatedUserID(c *gin.Context) (uuid.UUID, bool) {
+	sc := pkg.Claims(c)
+	if sc == nil {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(sc.Subject())
+	if err != nil {
+		log.LoggerFromContext(c).With("error", err).
+			Warn("authenticated subject is not a valid UUID — audit event will fall back to the client-supplied user_id")
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
 // Known Locations Management is admin-only: "Menu item shall be visible
 // only to users with Agency Admin or System Administrator or Global
 // Administrator role[s]. Non-Admin users shall NOT have access to this
@@ -201,6 +230,11 @@ func serviceClaims(sc *auth.Jwt) *jwtpkg.ServiceClaims {
 // caller must be a sentinel System/Global Administrator, or hold the
 // Agency Admin role at the target agency. It must run after withAgencyId
 // and claimsValidationMiddleware.
+//
+// On every allow path it also records which of those roles applied via
+// pkg.ResolvedRoleKey, so the handler can attribute the mutation's audit
+// event (see internal/audit.Actor.Role) to a real role without a second
+// RPC — this middleware already resolved it synchronously from JWT claims.
 func requireAgencyAdmin(c *gin.Context) {
 	// No real IDP (and no authz sidecar exists for this service) in an
 	// environment that disables JWT verification, so there's no legitimate
@@ -223,12 +257,19 @@ func requireAgencyAdmin(c *gin.Context) {
 		return
 	}
 
-	if svc.IsGlobalAdmin() || svc.IsSystemAdmin() {
+	if svc.IsGlobalAdmin() {
+		c.Set(pkg.ResolvedRoleKey(), api.GlobalAdmin)
+		c.Next()
+		return
+	}
+	if svc.IsSystemAdmin() {
+		c.Set(pkg.ResolvedRoleKey(), api.SystemAdmin)
 		c.Next()
 		return
 	}
 
 	if isAgencyAdmin(svc, pkg.AgencyID(c)) {
+		c.Set(pkg.ResolvedRoleKey(), api.AgencyAdmin)
 		c.Next()
 		return
 	}

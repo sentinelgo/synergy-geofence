@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
@@ -47,7 +48,7 @@ func TestLogGeofenceCreated(t *testing.T) {
 	agencyID := uuid.New()
 
 	LogGeofenceCreated(context.Background(), l,
-		Actor{UserID: userID, IP: "10.0.0.1"},
+		Actor{UserID: userID, IP: "10.0.0.1", Role: "agencyadmin"},
 		Resource{ID: geofenceID, Name: "Downtown Office", AgencyID: agencyID},
 		map[string]any{"name": "Downtown Office"},
 	)
@@ -69,8 +70,9 @@ func TestLogGeofenceCreated(t *testing.T) {
 	if req.GetStatus() != pb.ActionStatus_SUCCESS {
 		t.Errorf("Status = %v, want SUCCESS", req.GetStatus())
 	}
-	if req.GetMessage() != messageCreated {
-		t.Errorf("Message = %q, want %q", req.GetMessage(), messageCreated)
+	wantMessage := "Agency Configuration: Known Location Downtown Office Added"
+	if req.GetMessage() != wantMessage {
+		t.Errorf("Message = %q, want %q", req.GetMessage(), wantMessage)
 	}
 
 	// Resource.Type stays RESOURCE_OTHER — synergy-common still has no
@@ -90,6 +92,9 @@ func TestLogGeofenceCreated(t *testing.T) {
 	if req.Metadata["resource_kind"] != resourceKindGeofence {
 		t.Errorf(`Metadata["resource_kind"] = %q, want %q`, req.Metadata["resource_kind"], resourceKindGeofence)
 	}
+	if req.Metadata["role"] != "agencyadmin" {
+		t.Errorf(`Metadata["role"] = %q, want %q`, req.Metadata["role"], "agencyadmin")
+	}
 
 	if req.GetActor().GetId() != userID.String() {
 		t.Errorf("Actor.Id = %q, want %q", req.GetActor().GetId(), userID.String())
@@ -107,38 +112,41 @@ func TestLogGeofenceCreated(t *testing.T) {
 
 func TestLogGeofenceUpdated(t *testing.T) {
 	tests := []struct {
-		name        string
-		diff        map[string]any
-		wantActions []string
+		name                       string
+		changes                    []FieldChange
+		colocationExclusionChanged *bool
+		wantActions                []string
 	}{
 		{
 			name:        "generic detail field only",
-			diff:        map[string]any{"name": "New Name"},
+			changes:     []FieldChange{{Field: "Name", Old: "Old Name", New: "New Name"}},
 			wantActions: []string{actionUpdated},
 		},
 		{
 			name:        "geometry only",
-			diff:        map[string]any{"type": "polygon", "geo_json": "{}"},
+			changes:     []FieldChange{{Field: "Location", Old: "Point", New: "Polygon"}},
 			wantActions: []string{actionGeometryUpdated},
 		},
 		{
 			name:        "status only",
-			diff:        map[string]any{"status": "inactive"},
+			changes:     []FieldChange{{Field: "Status", Old: "active", New: "inactive"}},
 			wantActions: []string{actionStatusChanged},
 		},
 		{
-			name:        "colocation exclusion only",
-			diff:        map[string]any{"exclude_from_colocation": true},
-			wantActions: []string{actionColocationExclusionChanged},
+			name:                       "colocation exclusion only",
+			colocationExclusionChanged: ptr(true),
+			wantActions:                []string{actionColocationExclusionChanged},
 		},
 		{
-			name:        "geometry and status together emit two distinct events",
-			diff:        map[string]any{"type": "circle", "geo_json": "{}", "status": "archived"},
+			name: "geometry and status together emit two distinct events",
+			changes: []FieldChange{
+				{Field: "Location", Old: "Point", New: "Circle"},
+				{Field: "Status", Old: "active", New: "archived"},
+			},
 			wantActions: []string{actionGeometryUpdated, actionStatusChanged},
 		},
 		{
-			name:        "empty diff emits nothing",
-			diff:        map[string]any{},
+			name:        "no changes emits nothing",
 			wantActions: nil,
 		},
 	}
@@ -148,8 +156,8 @@ func TestLogGeofenceUpdated(t *testing.T) {
 			l := &captureLogger{}
 			LogGeofenceUpdated(context.Background(), l,
 				Actor{UserID: uuid.New()},
-				Resource{ID: uuid.New(), AgencyID: uuid.New()},
-				tc.diff,
+				Resource{ID: uuid.New(), Name: "Downtown Office", AgencyID: uuid.New()},
+				tc.changes, tc.colocationExclusionChanged, tc.changes,
 			)
 
 			if len(l.reqs) != len(tc.wantActions) {
@@ -166,9 +174,79 @@ func TestLogGeofenceUpdated(t *testing.T) {
 					// real regression would leave it at the zero value.
 					t.Errorf("Action %q has zero-value Category", wantAction)
 				}
-				if req.GetDetails() == "" {
-					t.Errorf("Action %q: Details was not set from the diff", wantAction)
+				if len(tc.changes) > 0 && req.GetDetails() == "" {
+					t.Errorf("Action %q: Details was not set from the changes", wantAction)
 				}
+			}
+		})
+	}
+}
+
+// TestLogGeofenceUpdated_MessageText locks down the exact "Known Location
+// <Name> Modified <Field> from <Old> to <New>" text per changed field.
+func TestLogGeofenceUpdated_MessageText(t *testing.T) {
+	l := &captureLogger{}
+	LogGeofenceUpdated(context.Background(), l,
+		Actor{UserID: uuid.New()},
+		Resource{ID: uuid.New(), Name: "Downtown Office", AgencyID: uuid.New()},
+		[]FieldChange{
+			{Field: "Name", Old: "Old Name", New: "New Name"},
+			{Field: "Status", Old: "active", New: "inactive"},
+		}, nil, nil,
+	)
+
+	want := map[string]string{
+		actionUpdated:       "Agency Configuration: Known Location Downtown Office Modified Name from Old Name to New Name",
+		actionStatusChanged: "Agency Configuration: Known Location Downtown Office Modified Status from active to inactive",
+	}
+	if len(l.reqs) != len(want) {
+		t.Fatalf("Log was called %d times, want %d", len(l.reqs), len(want))
+	}
+	for action, wantMessage := range want {
+		req := l.action(action)
+		if req == nil {
+			t.Fatalf("no single request with Action %q", action)
+		}
+		if req.GetMessage() != wantMessage {
+			t.Errorf("Action %q: Message = %q, want %q", action, req.GetMessage(), wantMessage)
+		}
+	}
+}
+
+// TestLogGeofenceUpdated_ColocationMessageText locks down the Excluded/
+// Included wording, which — unlike every other field — has no "from <Old>
+// to <New>" clause: it just flips between two fixed sentences based on the
+// flag's new value.
+func TestLogGeofenceUpdated_ColocationMessageText(t *testing.T) {
+	tests := []struct {
+		excluded    bool
+		wantMessage string
+	}{
+		{excluded: true, wantMessage: "Agency Configuration: Known Location Downtown Office Excluded from Co-Location Report."},
+		{excluded: false, wantMessage: "Agency Configuration: Known Location Downtown Office Included for Co-Location Report."},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("excluded=%v", tc.excluded), func(t *testing.T) {
+			l := &captureLogger{}
+			LogGeofenceUpdated(context.Background(), l,
+				Actor{UserID: uuid.New()},
+				Resource{ID: uuid.New(), Name: "Downtown Office", AgencyID: uuid.New()},
+				nil, ptr(tc.excluded), nil,
+			)
+
+			if len(l.reqs) != 1 {
+				t.Fatalf("Log was called %d times, want 1", len(l.reqs))
+			}
+			req := l.reqs[0]
+			if req.GetAction() != actionColocationExclusionChanged {
+				t.Errorf("Action = %q, want %q", req.GetAction(), actionColocationExclusionChanged)
+			}
+			if req.GetCategory() != pb.EventCategory_SETTINGS_CHANGED {
+				t.Errorf("Category = %v, want SETTINGS_CHANGED", req.GetCategory())
+			}
+			if req.GetMessage() != tc.wantMessage {
+				t.Errorf("Message = %q, want %q", req.GetMessage(), tc.wantMessage)
 			}
 		})
 	}
@@ -178,14 +256,14 @@ func TestLogGeofenceUpdated_CategoriesMatchSpec(t *testing.T) {
 	l := &captureLogger{}
 	LogGeofenceUpdated(context.Background(), l,
 		Actor{UserID: uuid.New()},
-		Resource{ID: uuid.New(), AgencyID: uuid.New()},
-		map[string]any{
-			"name":                    "New Name",
-			"type":                    "polygon",
-			"geo_json":                "{}",
-			"status":                  "inactive",
-			"exclude_from_colocation": true,
+		Resource{ID: uuid.New(), Name: "Downtown Office", AgencyID: uuid.New()},
+		[]FieldChange{
+			{Field: "Name", Old: "Old Name", New: "New Name"},
+			{Field: "Location", Old: "Point", New: "Polygon"},
+			{Field: "Status", Old: "active", New: "inactive"},
 		},
+		ptr(true),
+		nil,
 	)
 
 	want := map[string]pb.EventCategory{
@@ -214,7 +292,7 @@ func TestLogGeofenceDeleted(t *testing.T) {
 
 	LogGeofenceDeleted(context.Background(), l,
 		Actor{UserID: uuid.New()},
-		Resource{ID: geofenceID, AgencyID: uuid.New()},
+		Resource{ID: geofenceID, Name: "Downtown Office", AgencyID: uuid.New()},
 	)
 
 	if len(l.reqs) != 1 {
@@ -228,8 +306,9 @@ func TestLogGeofenceDeleted(t *testing.T) {
 	if req.GetCategory() != pb.EventCategory_DELETED {
 		t.Errorf("Category = %v, want DELETED", req.GetCategory())
 	}
-	if req.GetMessage() != messageDeleted {
-		t.Errorf("Message = %q, want %q", req.GetMessage(), messageDeleted)
+	wantMessage := "Agency Configuration: Known Location Downtown Office Deleted"
+	if req.GetMessage() != wantMessage {
+		t.Errorf("Message = %q, want %q", req.GetMessage(), wantMessage)
 	}
 	if req.GetResource().GetId() != geofenceID.String() {
 		t.Errorf("Resource.Id = %q, want %q", req.GetResource().GetId(), geofenceID.String())
@@ -242,3 +321,25 @@ func TestLogGeofenceDeleted(t *testing.T) {
 func TestLogGeofenceCreated_NilLogger(t *testing.T) {
 	LogGeofenceCreated(context.Background(), nil, Actor{UserID: uuid.New()}, Resource{ID: uuid.New(), AgencyID: uuid.New()}, nil)
 }
+
+// TestLogGeofenceCreated_NoRoleOmitsMetadataKey guards log1's
+// mirror of synergy-sidecar's WithRole: an unresolved Role (e.g. JWT
+// verification disabled, so requireAgencyAdmin never ran) must leave the
+// "role" key out of Metadata entirely, not set it to "".
+func TestLogGeofenceCreated_NoRoleOmitsMetadataKey(t *testing.T) {
+	l := &captureLogger{}
+	LogGeofenceCreated(context.Background(), l,
+		Actor{UserID: uuid.New()},
+		Resource{ID: uuid.New(), AgencyID: uuid.New()},
+		nil,
+	)
+
+	req := l.reqs[0]
+	if _, ok := req.Metadata["role"]; ok {
+		t.Errorf(`Metadata["role"] = %q, want key absent`, req.Metadata["role"])
+	}
+}
+
+// ptr is a small local helper for building the *bool colocationExclusionChanged
+// arg inline in table-driven tests, above.
+func ptr[T any](v T) *T { return &v }

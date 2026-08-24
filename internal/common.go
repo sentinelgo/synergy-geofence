@@ -14,9 +14,10 @@ const (
 	Message    = "message"
 	Type       = "type"
 
-	agencyIdKey = "agency_id"
-	clientIdKey = "client_id"
-	claimsKey   = "claims"
+	agencyIdKey     = "agency_id"
+	clientIdKey     = "client_id"
+	claimsKey       = "claims"
+	resolvedRoleKey = "resolved_role"
 )
 
 // Claims returns the authenticated caller's resolved JWT/role claims set by
@@ -46,6 +47,26 @@ func AgencyID(c *gin.Context) uuid.UUID {
 
 func AgencyIDKey() string {
 	return agencyIdKey
+}
+
+// ResolvedRole returns the role (one of the api.*Admin template constants,
+// e.g. api.AgencyAdmin) requireAgencyAdmin resolved the caller as holding
+// for this request, or "" if no admin role was resolved — e.g. JWT
+// verification is disabled, or the route isn't gated by requireAgencyAdmin
+// at all. Consumed by the audit package (see internal/audit.Actor.Role) so
+// mutation audit events carry role attribution without a second RPC:
+// requireAgencyAdmin already resolves this synchronously from JWT claims
+// before the handler runs.
+func ResolvedRole(c *gin.Context) string {
+	if x, ok := c.Get(resolvedRoleKey); ok {
+		return x.(string)
+	}
+
+	return ""
+}
+
+func ResolvedRoleKey() string {
+	return resolvedRoleKey
 }
 
 // ClientID returns the optional client scoping identity resolved by the withClientId middleware, if present.
