@@ -2,12 +2,18 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	gohttp "net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	pkg "github.com/sentinelgo/synergy-geofence/internal"
+	"github.com/sentinelgo/synergy-geofence/internal/audit"
 	"github.com/sentinelgo/synergy-geofence/internal/database"
 	"github.com/sentinelgo/synergy-geofence/internal/database/model"
 	localerrors "github.com/sentinelgo/synergy-geofence/internal/errors"
@@ -22,6 +28,7 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
 
+	activitylogger "github.com/sentinelgo/synergy-common/pkg/activity-logger"
 	"github.com/sentinelgo/synergy-common/pkg/config"
 	db "github.com/sentinelgo/synergy-common/pkg/database"
 	"github.com/sentinelgo/synergy-common/pkg/http/token"
@@ -29,6 +36,16 @@ import (
 	"github.com/sentinelgo/synergy-common/pkg/otelx"
 	gincommon "github.com/sentinelgo/synergy-common/pkg/otelx/gin"
 )
+
+// shutdownGracePeriod bounds the whole post-signal shutdown path: draining
+// in-flight HTTP requests via srv.Shutdown, then closing the Pulsar
+// publisher and the activity logger (see gracefulShutdown). Mirrors
+// synergy-sidecar's own shutdownGracePeriod (see its app.go) — same class
+// of problem, same budget — rather than inventing a new one. Unlike
+// sidecar, geofence has no async background work analogous to its
+// role-enrichment lookups, so there's no second phase competing for this
+// same budget.
+const shutdownGracePeriod = 15 * time.Second
 
 func Execute() {
 	log.SetDefault(log.WithLevel(log.LevelTrace))
@@ -121,6 +138,13 @@ func Execute() {
 	dbc.DB().Config.Logger = log.AsGormLogger(log.Default(), gormlogger.Silent)
 	_ = dbc.DB().Use(tracing.NewPlugin(tracing.WithoutMetrics(), tracing.WithTracerProvider(otel.GetTracerProvider())))
 
+	// publisher and activityLog are both closed explicitly in the shutdown
+	// paths below (the signal case and gracefulShutdown), not deferred here:
+	// this function's defers never run on a normal SIGTERM — router.Run
+	// (its historical equivalent below) blocks forever, so Execute() itself
+	// never returns for a deferred statement to fire on. A container
+	// stop/redeploy just kills the process, silently dropping whatever's
+	// still queued in either client.
 	var publisher events2.Publisher = events2.NoopPublisher{}
 	if eventsCfg, eerr := config.FromViper[events2.Config](); eerr != nil {
 		l.With("error", eerr).Warn("could not load pulsar config, geofence events will not be published")
@@ -129,11 +153,16 @@ func Execute() {
 			l.With("error", perr).Error("could not connect to pulsar, geofence events will not be published")
 		} else {
 			publisher = pulsarPublisher
-			defer pulsarPublisher.Close()
 		}
 	}
 
-	gc := NewGeofenceController(gdbc, cfg, publisher)
+	auditCfg, auditCfgErr := audit.ConfigFromViper()
+	if auditCfgErr != nil {
+		l.With("error", auditCfgErr).Warn("could not load activity-log config, geofence audit events will not be recorded")
+	}
+	activityLog := audit.NewLogger(auditCfg, l)
+
+	gc := NewGeofenceController(gdbc, cfg, publisher, activityLog)
 
 	claimsMiddleware := claimsValidationMiddleware()
 
@@ -151,8 +180,66 @@ func Execute() {
 		PATCH("/:geofence_id", requireAgencyAdmin, gc.UpdateGeofence).
 		DELETE("/:geofence_id", requireAgencyAdmin, gc.DeleteGeofence)
 
+	srv := &gohttp.Server{
+		Addr:    cfg.Common.Server.HostPort(),
+		Handler: router,
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() {
+		if serveErr := srv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, gohttp.ErrServerClosed) {
+			serveErrCh <- serveErr
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
 	l.With("version", fmt.Sprintf("v%s", cfg.Version)).Info("geofence service ready")
-	l.With("error", router.Run(cfg.Common.Server.HostPort())).Error("geofence service ended")
+
+	select {
+	case serveErr := <-serveErrCh:
+		l.With("error", serveErr).Error("geofence service failed to serve — shutting down")
+		publisher.Close()
+		if cerr := activityLog.Close(); cerr != nil {
+			l.With("error", cerr).Warn("activity logger did not close cleanly")
+		}
+		os.Exit(1)
+	case <-quit:
+		l.Info("shutdown signal received, draining in-flight requests")
+	}
+
+	gracefulShutdown(l, srv, publisher, activityLog)
+	l.Info("geofence service ended")
+}
+
+// shutdownServer is the subset of *gohttp.Server's lifecycle gracefulShutdown
+// needs, so tests can substitute a fake instead of binding a real port.
+type shutdownServer interface {
+	Shutdown(ctx context.Context) error
+}
+
+// gracefulShutdown drains in-flight HTTP requests via srv.Shutdown, then
+// closes publisher and activityLog — in that order, so no new
+// HTTP-triggered event starts publishing after the queues begin draining.
+// All three share shutdownGracePeriod as a single deadline for the first
+// step; publisher.Close and activityLog.Close take no context of their own
+// (see events2.Publisher.Close and activitylogger.Logger.Close — the
+// latter has its own independent internal timeout, 12s by default per
+// synergy-common's activitylogger.WithCloseTimeout) and so aren't bounded
+// by it directly, but both are expected to return quickly once the server
+// has stopped accepting new requests.
+func gracefulShutdown(l log.Interface, srv shutdownServer, publisher events2.Publisher, activityLog activitylogger.Logger) {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		l.With("error", err).Warn("graceful shutdown did not complete cleanly")
+	}
+
+	publisher.Close()
+	if err := activityLog.Close(); err != nil {
+		l.With("error", err).Warn("activity logger did not close cleanly")
+	}
 }
 
 func healthCheck(c *gin.Context) {

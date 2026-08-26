@@ -23,6 +23,9 @@ common:
     # left unset rather than wired up here.
   sidecar:
     base-url: ${SIDECAR_URL}
+  activity-log:
+    disabled: false
+    address: ${ACTIVITY_LOG_ADDRESS}
   geofence:
     enabled: ${GEOFENCE_AUTH_ENABLED}
     audience: ${GEOFENCE_AUTH_AUDIENCE}

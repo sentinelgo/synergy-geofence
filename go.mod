@@ -7,7 +7,7 @@ require (
 	github.com/auth0/go-jwt-middleware/v3 v3.2.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
-	github.com/sentinelgo/synergy-common v1.27.0
+	github.com/sentinelgo/synergy-common v1.28.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/swaggo/files v1.0.1
