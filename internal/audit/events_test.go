@@ -64,8 +64,8 @@ func TestLogGeofenceCreated(t *testing.T) {
 	if req.GetType() != pb.EventType_ACTIVITY {
 		t.Errorf("Type = %v, want ACTIVITY", req.GetType())
 	}
-	if req.GetCategory() != pb.EventCategory_CREATED {
-		t.Errorf("Category = %v, want CREATED", req.GetCategory())
+	if req.GetCategory() != pb.EventCategory_AGENCY_KNOWN_LOCATION_ADDED {
+		t.Errorf("Category = %v, want AGENCY_KNOWN_LOCATION_ADDED", req.GetCategory())
 	}
 	if req.GetStatus() != pb.ActionStatus_SUCCESS {
 		t.Errorf("Status = %v, want SUCCESS", req.GetStatus())
@@ -119,17 +119,40 @@ func TestLogGeofenceUpdated(t *testing.T) {
 	}{
 		{
 			name:        "generic detail field only",
-			changes:     []FieldChange{{Field: "Name", Old: "Old Name", New: "New Name"}},
+			changes:     []FieldChange{{Field: FieldName, Old: "Old Name", New: "New Name"}},
 			wantActions: []string{actionUpdated},
 		},
 		{
-			name:        "geometry only",
-			changes:     []FieldChange{{Field: "Location", Old: "Point", New: "Polygon"}},
+			name:        "geometry only (Location — Point/Circle center move)",
+			changes:     []FieldChange{{Field: FieldLocation, Old: "Point", New: "Polygon"}},
+			wantActions: []string{actionGeometryUpdated},
+		},
+		{
+			// Regression coverage for the shape-kind-change label
+			// introduced alongside Radius/Boundary below: all four geometry
+			// labels geoJSONFieldChange can emit must route the same way.
+			name:        "geometry only (Shape — kind changed)",
+			changes:     []FieldChange{{Field: FieldShape, Old: "Circle", New: "Polygon"}},
+			wantActions: []string{actionGeometryUpdated},
+		},
+		{
+			name:        "geometry only (Radius — Circle radius changed)",
+			changes:     []FieldChange{{Field: FieldRadius, Old: "500 m", New: "750 m"}},
+			wantActions: []string{actionGeometryUpdated},
+		},
+		{
+			name:        "geometry only (Boundary — Rectangle/Polygon redrawn)",
+			changes:     []FieldChange{{Field: FieldBoundary, Old: "(33.7, -84.4) to (33.8, -84.3)", New: "(33.6, -84.5) to (33.9, -84.2)"}},
+			wantActions: []string{actionGeometryUpdated},
+		},
+		{
+			name:        "geometry only (Address — embedded address edited)",
+			changes:     []FieldChange{{Field: FieldAddress, Old: "123 Main St", New: "456 Oak Ave"}},
 			wantActions: []string{actionGeometryUpdated},
 		},
 		{
 			name:        "status only",
-			changes:     []FieldChange{{Field: "Status", Old: "active", New: "inactive"}},
+			changes:     []FieldChange{{Field: FieldStatus, Old: "active", New: "inactive"}},
 			wantActions: []string{actionStatusChanged},
 		},
 		{
@@ -140,8 +163,8 @@ func TestLogGeofenceUpdated(t *testing.T) {
 		{
 			name: "geometry and status together emit two distinct events",
 			changes: []FieldChange{
-				{Field: "Location", Old: "Point", New: "Circle"},
-				{Field: "Status", Old: "active", New: "archived"},
+				{Field: FieldLocation, Old: "Point", New: "Circle"},
+				{Field: FieldStatus, Old: "active", New: "archived"},
 			},
 			wantActions: []string{actionGeometryUpdated, actionStatusChanged},
 		},
@@ -168,10 +191,11 @@ func TestLogGeofenceUpdated(t *testing.T) {
 				if req == nil {
 					t.Fatalf("no single request with Action %q among %d captured", wantAction, len(l.reqs))
 				}
-				if req.GetCategory() == 0 && wantAction != actionUpdated {
-					// every non-generic action here maps to a non-zero
-					// category (UPDATED=11 or SETTINGS_CHANGED=5); only a
-					// real regression would leave it at the zero value.
+				if req.GetCategory() == 0 {
+					// every action LogGeofenceUpdated emits maps to a
+					// non-zero category (AGENCY_KNOWN_LOCATION_MODIFIED/
+					// INCLUDED/EXCLUDED); only a real regression would leave
+					// it at the zero value (LOGIN).
 					t.Errorf("Action %q has zero-value Category", wantAction)
 				}
 				if len(tc.changes) > 0 && req.GetDetails() == "" {
@@ -179,6 +203,51 @@ func TestLogGeofenceUpdated(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestLogGeofenceUpdated_CombinedGeometryAndAddressChange guards a case
+// geoJSONFieldChange can produce for a single PATCH: two FieldChange
+// entries sharing the same Field-derived Action (actionGeometryUpdated)
+// but distinct Field labels and messages, e.g. a Circle's radius and its
+// address edited in one request. l.action() can't disambiguate two
+// requests sharing an Action (see its own doc comment), so this asserts on
+// the captured messages directly instead.
+func TestLogGeofenceUpdated_CombinedGeometryAndAddressChange(t *testing.T) {
+	l := &captureLogger{}
+	LogGeofenceUpdated(context.Background(), l,
+		Actor{UserID: uuid.New()},
+		Resource{ID: uuid.New(), Name: "Downtown Office", AgencyID: uuid.New()},
+		[]FieldChange{
+			{Field: FieldRadius, Old: "500 m", New: "750 m"},
+			{Field: FieldAddress, Old: "123 Main St", New: "456 Oak Ave"},
+		}, nil, nil,
+	)
+
+	if len(l.reqs) != 2 {
+		t.Fatalf("Log was called %d times, want 2", len(l.reqs))
+	}
+	wantMessages := map[string]bool{
+		"Agency Configuration: Known Location Downtown Office Modified Radius from 500 m to 750 m":              false,
+		"Agency Configuration: Known Location Downtown Office Modified Address from 123 Main St to 456 Oak Ave": false,
+	}
+	for _, req := range l.reqs {
+		if req.GetAction() != actionGeometryUpdated {
+			t.Errorf("Action = %q, want %q", req.GetAction(), actionGeometryUpdated)
+		}
+		if req.GetCategory() != pb.EventCategory_AGENCY_KNOWN_LOCATION_MODIFIED {
+			t.Errorf("Category = %v, want AGENCY_KNOWN_LOCATION_MODIFIED", req.GetCategory())
+		}
+		if _, ok := wantMessages[req.GetMessage()]; !ok {
+			t.Errorf("unexpected Message = %q", req.GetMessage())
+			continue
+		}
+		wantMessages[req.GetMessage()] = true
+	}
+	for msg, seen := range wantMessages {
+		if !seen {
+			t.Errorf("expected message not seen: %q", msg)
+		}
 	}
 }
 
@@ -190,8 +259,8 @@ func TestLogGeofenceUpdated_MessageText(t *testing.T) {
 		Actor{UserID: uuid.New()},
 		Resource{ID: uuid.New(), Name: "Downtown Office", AgencyID: uuid.New()},
 		[]FieldChange{
-			{Field: "Name", Old: "Old Name", New: "New Name"},
-			{Field: "Status", Old: "active", New: "inactive"},
+			{Field: FieldName, Old: "Old Name", New: "New Name"},
+			{Field: FieldStatus, Old: "active", New: "inactive"},
 		}, nil, nil,
 	)
 
@@ -219,11 +288,12 @@ func TestLogGeofenceUpdated_MessageText(t *testing.T) {
 // flag's new value.
 func TestLogGeofenceUpdated_ColocationMessageText(t *testing.T) {
 	tests := []struct {
-		excluded    bool
-		wantMessage string
+		excluded     bool
+		wantMessage  string
+		wantCategory pb.EventCategory
 	}{
-		{excluded: true, wantMessage: "Agency Configuration: Known Location Downtown Office Excluded from Co-Location Report."},
-		{excluded: false, wantMessage: "Agency Configuration: Known Location Downtown Office Included for Co-Location Report."},
+		{excluded: true, wantMessage: "Agency Configuration: Known Location Downtown Office Excluded from Co-Location Report.", wantCategory: pb.EventCategory_AGENCY_KNOWN_LOCATION_EXCLUDED},
+		{excluded: false, wantMessage: "Agency Configuration: Known Location Downtown Office Included for Co-Location Report.", wantCategory: pb.EventCategory_AGENCY_KNOWN_LOCATION_INCLUDED},
 	}
 
 	for _, tc := range tests {
@@ -242,8 +312,8 @@ func TestLogGeofenceUpdated_ColocationMessageText(t *testing.T) {
 			if req.GetAction() != actionColocationExclusionChanged {
 				t.Errorf("Action = %q, want %q", req.GetAction(), actionColocationExclusionChanged)
 			}
-			if req.GetCategory() != pb.EventCategory_SETTINGS_CHANGED {
-				t.Errorf("Category = %v, want SETTINGS_CHANGED", req.GetCategory())
+			if req.GetCategory() != tc.wantCategory {
+				t.Errorf("Category = %v, want %v", req.GetCategory(), tc.wantCategory)
 			}
 			if req.GetMessage() != tc.wantMessage {
 				t.Errorf("Message = %q, want %q", req.GetMessage(), tc.wantMessage)
@@ -258,19 +328,19 @@ func TestLogGeofenceUpdated_CategoriesMatchSpec(t *testing.T) {
 		Actor{UserID: uuid.New()},
 		Resource{ID: uuid.New(), Name: "Downtown Office", AgencyID: uuid.New()},
 		[]FieldChange{
-			{Field: "Name", Old: "Old Name", New: "New Name"},
-			{Field: "Location", Old: "Point", New: "Polygon"},
-			{Field: "Status", Old: "active", New: "inactive"},
+			{Field: FieldName, Old: "Old Name", New: "New Name"},
+			{Field: FieldLocation, Old: "Point", New: "Polygon"},
+			{Field: FieldStatus, Old: "active", New: "inactive"},
 		},
 		ptr(true),
 		nil,
 	)
 
 	want := map[string]pb.EventCategory{
-		actionUpdated:                    pb.EventCategory_UPDATED,
-		actionGeometryUpdated:            pb.EventCategory_UPDATED,
-		actionStatusChanged:              pb.EventCategory_SETTINGS_CHANGED,
-		actionColocationExclusionChanged: pb.EventCategory_SETTINGS_CHANGED,
+		actionUpdated:                    pb.EventCategory_AGENCY_KNOWN_LOCATION_MODIFIED,
+		actionGeometryUpdated:            pb.EventCategory_AGENCY_KNOWN_LOCATION_MODIFIED,
+		actionStatusChanged:              pb.EventCategory_AGENCY_KNOWN_LOCATION_MODIFIED,
+		actionColocationExclusionChanged: pb.EventCategory_AGENCY_KNOWN_LOCATION_EXCLUDED,
 	}
 	if len(l.reqs) != len(want) {
 		t.Fatalf("Log was called %d times, want %d", len(l.reqs), len(want))
@@ -303,8 +373,8 @@ func TestLogGeofenceDeleted(t *testing.T) {
 	if req.GetAction() != actionDeleted {
 		t.Errorf("Action = %q, want %q", req.GetAction(), actionDeleted)
 	}
-	if req.GetCategory() != pb.EventCategory_DELETED {
-		t.Errorf("Category = %v, want DELETED", req.GetCategory())
+	if req.GetCategory() != pb.EventCategory_AGENCY_KNOWN_LOCATION_DELETED {
+		t.Errorf("Category = %v, want AGENCY_KNOWN_LOCATION_DELETED", req.GetCategory())
 	}
 	wantMessage := "Agency Configuration: Known Location Downtown Office Deleted"
 	if req.GetMessage() != wantMessage {

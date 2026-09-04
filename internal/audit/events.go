@@ -59,35 +59,62 @@ type FieldChange struct {
 
 // ── schema mapping ──────────────────────────────────────────────────────
 //
-// synergy-common v1.28.x+ added generic, resource-agnostic
-// EventCategory_CREATED/UPDATED/DELETED values (SYN-3606) specifically so
-// plain create/update/delete audit events — like every one of geofence's —
-// have a real category to set instead of EventCategory's zero value
-// (LOGIN, a real, meaningful category — not an "unspecified" sentinel).
+// synergy-common's feat/audit-event-category-updated (post-v1.29.0)
+// replaced the generic, resource-agnostic EventCategory_CREATED/UPDATED/
+// DELETED values (SYN-3606) this package originally used with a dedicated
+// "Known Location" category per event shape —
+// AGENCY_KNOWN_LOCATION_ADDED/DELETED/MODIFIED/INCLUDED/EXCLUDED — since
+// geofence *is* the Known Location feature's backing resource. This is a
+// breaking renumbering (CREATED/UPDATED/DELETED's old slots 10-12 are
+// reused for unrelated categories), not an addition, so there is no
+// version of synergy-common where both old and new values are valid —
+// bumping past v1.29.0 requires this rewrite.
 //
 // ResourceType still has no GEOFENCE value, and the proto documents
 // Metadata as the sanctioned place for attributes that don't have a schema
 // field of their own, so Resource.Type stays RESOURCE_OTHER with the real
 // kind stamped into Metadata["resource_kind"] until that's added upstream
-// too (tracked separately from SYN-3606's Category work — see
-// geofenceResource below).
+// too (tracked separately from the Category work — see geofenceResource
+// below).
 //
 // The six events below (create, the four update variants, delete) are the
-// full geofence audit event catalog as specified for SYN-3606, with UI text
-// reworked for the Known Location requirement below: every message now
-// leads with "Agency Configuration: Known Location <Name>" and the four
-// update variants collapse into two shapes — "Modified <Field> from <Old>
-// to <New>" (one event per changed field) and "Excluded from"/"Included
-// for Co-Location Report." (the exclusion flag flips between the two,
-// rather than reporting a before/after value).
+// full geofence audit event catalog, with UI text per the Known Location
+// requirement: every message leads with "Agency Configuration: Known
+// Location <Name>" and the four update variants collapse into two shapes —
+// "Modified <Field> from <Old> to <New>" (one event per changed field,
+// Category MODIFIED regardless of which field) and "Excluded from"/
+// "Included for Co-Location Report." (the exclusion flag flips between the
+// two, rather than reporting a before/after value, and carries its own
+// dedicated EXCLUDED/INCLUDED Category instead of MODIFIED).
 //
-//	Action                                  Category         UI text
-//	geofence.created                        CREATED          Known Location <Name> Added
-//	geofence.updated                        UPDATED          Known Location <Name> Modified <Field> from <Old> to <New>
-//	geofence.geometry.updated               UPDATED          Known Location <Name> Modified Location from <Old> to <New>
-//	geofence.status.changed                 SETTINGS_CHANGED Known Location <Name> Modified Status from <Old> to <New>
-//	geofence.deleted                        DELETED          Known Location <Name> Deleted
-//	geofence.colocation_exclusion.changed   SETTINGS_CHANGED Known Location <Name> Excluded from/Included for Co-Location Report.
+//	Action                                  Category                       UI text
+//	geofence.created                        AGENCY_KNOWN_LOCATION_ADDED    Known Location <Name> Added
+//	geofence.updated                        AGENCY_KNOWN_LOCATION_MODIFIED Known Location <Name> Modified <Field> from <Old> to <New>
+//	geofence.geometry.updated               AGENCY_KNOWN_LOCATION_MODIFIED Known Location <Name> Modified Shape/Radius/Boundary/Location from <Old> to <New>
+//	geofence.status.changed                 AGENCY_KNOWN_LOCATION_MODIFIED Known Location <Name> Modified Status from <Old> to <New>
+//	geofence.deleted                        AGENCY_KNOWN_LOCATION_DELETED  Known Location <Name> Deleted
+//	geofence.colocation_exclusion.changed   AGENCY_KNOWN_LOCATION_EXCLUDED/INCLUDED   Known Location <Name> Excluded from/Included for Co-Location Report.
+//
+// Field labels used as FieldChange.Field, exported so that callers
+// building FieldChange values (controller.go's geofenceFieldChanges /
+// geoJSONFieldChange) and this package's own Action/Category routing
+// (LogGeofenceUpdated's switch, below) share one definition instead of
+// each hardcoding the same string literals — a typo or a renamed label in
+// only one of the two places used to degrade silently (the event would
+// still log, just under the generic action/category) with no compiler or
+// test signal.
+const (
+	FieldName     = "Name"
+	FieldStatus   = "Status"
+	FieldClient   = "Client"
+	FieldShape    = "Shape"
+	FieldRadius   = "Radius"
+	FieldBoundary = "Boundary"
+	FieldLocation = "Location"
+	FieldAddress  = "Address"
+	FieldNotes    = "Notes"
+)
+
 const (
 	resourceKindGeofence = "geofence"
 
@@ -110,7 +137,7 @@ const (
 // the created geofence's response payload) — pass the same value you're
 // already publishing on events.EventTypeCreated.
 func LogGeofenceCreated(ctx context.Context, l activitylogger.Logger, actor Actor, resource Resource, details any) {
-	log1(ctx, l, actor, resource, actionCreated, pb.EventCategory_CREATED, fmt.Sprintf(messageAddedFmt, resource.Name), details)
+	log1(ctx, l, actor, resource, actionCreated, pb.EventCategory_AGENCY_KNOWN_LOCATION_ADDED, fmt.Sprintf(messageAddedFmt, resource.Name), details)
 }
 
 // LogGeofenceUpdated records one audit event per changed business field
@@ -122,18 +149,24 @@ func LogGeofenceCreated(ctx context.Context, l activitylogger.Logger, actor Acto
 // differs (see FieldChange's doc comment for who builds these and how);
 // each becomes its own "Modified <Field> from <Old> to <New>" event, so a
 // PATCH touching e.g. both name and status emits two distinct, readable
-// events rather than one ambiguous "updated" event. A "Location" field
-// (i.e. what DiffChangedFields reports as geo_json/type) and a "Status"
-// field keep their original, more specific action/category
-// (actionGeometryUpdated/UPDATED and actionStatusChanged/SETTINGS_CHANGED
-// respectively); every other field name falls under the generic
-// actionUpdated/UPDATED.
+// events rather than one ambiguous "updated" event. Every one of these
+// shares Category AGENCY_KNOWN_LOCATION_MODIFIED — unlike the old
+// CREATED/UPDATED/DELETED-based schema, this one doesn't distinguish
+// "which field changed" at the category level, only at the Action/Field
+// level — but a geometry-derived field (i.e. what DiffChangedFields
+// reports as geo_json/type, rendered by controller.go's geoJSONFieldChange
+// as "Shape", "Radius", "Boundary", "Location" or "Address") and a "Status" field
+// still keep their own, more specific Action (actionGeometryUpdated /
+// actionStatusChanged) for anyone filtering the activity log by Action
+// rather than Category; every other field name falls under the generic
+// actionUpdated.
 //
 // colocationExclusionChanged, if non-nil, means the exclude_from_colocation
 // flag changed as part of this PATCH; its pointee is the flag's *new*
-// value (true -> Excluded, false -> Included) — this flag flips a binary
+// value (true -> Excluded/AGENCY_KNOWN_LOCATION_EXCLUDED, false ->
+// Included/AGENCY_KNOWN_LOCATION_INCLUDED) — this flag flips a binary
 // setting, so there's no "from/to" wording for it, unlike every other
-// field.
+// field, and it gets its own dedicated Category rather than MODIFIED.
 //
 // details is attached to every emitted event's Details, exactly like the
 // diff map this replaced — pass the same value you're already publishing
@@ -142,28 +175,28 @@ func LogGeofenceCreated(ctx context.Context, l activitylogger.Logger, actor Acto
 // they're reading.
 func LogGeofenceUpdated(ctx context.Context, l activitylogger.Logger, actor Actor, resource Resource, changes []FieldChange, colocationExclusionChanged *bool, details any) {
 	for _, ch := range changes {
-		action, category := actionUpdated, pb.EventCategory_UPDATED
+		action := actionUpdated
 		switch ch.Field {
-		case "Location":
+		case FieldShape, FieldRadius, FieldBoundary, FieldLocation, FieldAddress:
 			action = actionGeometryUpdated
-		case "Status":
-			action, category = actionStatusChanged, pb.EventCategory_SETTINGS_CHANGED
+		case FieldStatus:
+			action = actionStatusChanged
 		}
-		log1(ctx, l, actor, resource, action, category, fmt.Sprintf(messageModifiedFmt, resource.Name, ch.Field, ch.Old, ch.New), details)
+		log1(ctx, l, actor, resource, action, pb.EventCategory_AGENCY_KNOWN_LOCATION_MODIFIED, fmt.Sprintf(messageModifiedFmt, resource.Name, ch.Field, ch.Old, ch.New), details)
 	}
 
 	if colocationExclusionChanged != nil {
-		message := messageIncludedFmt
+		message, category := messageIncludedFmt, pb.EventCategory_AGENCY_KNOWN_LOCATION_INCLUDED
 		if *colocationExclusionChanged {
-			message = messageExcludedFmt
+			message, category = messageExcludedFmt, pb.EventCategory_AGENCY_KNOWN_LOCATION_EXCLUDED
 		}
-		log1(ctx, l, actor, resource, actionColocationExclusionChanged, pb.EventCategory_SETTINGS_CHANGED, fmt.Sprintf(message, resource.Name), details)
+		log1(ctx, l, actor, resource, actionColocationExclusionChanged, category, fmt.Sprintf(message, resource.Name), details)
 	}
 }
 
 // LogGeofenceDeleted records a geofence-deleted audit event.
 func LogGeofenceDeleted(ctx context.Context, l activitylogger.Logger, actor Actor, resource Resource) {
-	log1(ctx, l, actor, resource, actionDeleted, pb.EventCategory_DELETED, fmt.Sprintf(messageDeletedFmt, resource.Name), nil)
+	log1(ctx, l, actor, resource, actionDeleted, pb.EventCategory_AGENCY_KNOWN_LOCATION_DELETED, fmt.Sprintf(messageDeletedFmt, resource.Name), nil)
 }
 
 // userActor builds the Actor for a geofence mutation. There is no

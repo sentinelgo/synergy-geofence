@@ -4,13 +4,14 @@
 // the Pulsar lifecycle events in package events (which exist for downstream
 // consumers like the Co-Location Service, not for audit/compliance review).
 //
-// synergy-common's activity-logger proto (pkg/activity-logger/proto) has no
-// ResourceType_GEOFENCE and no geofence-specific EventCategory values yet —
-// confirmed against v1.28.0 (its newest released version) and every open
-// branch as of 2026-08-20 (SYN-3606). This package integrates against the
-// client as it exists today with a documented placeholder mapping (see
-// events.go), confined to one file so picking up the real schema later is a
-// small, isolated diff rather than a rewire of every call site.
+// synergy-common's activity-logger proto (pkg/activity-logger/proto) has
+// dedicated AGENCY_KNOWN_LOCATION_ADDED/DELETED/MODIFIED/INCLUDED/EXCLUDED
+// EventCategory values (feat/audit-event-category-updated, post-v1.29.0)
+// for exactly this resource, but still no ResourceType_GEOFENCE. This
+// package integrates against the client as it exists today with a
+// documented placeholder mapping (see events.go) for that remaining gap,
+// confined to one file so picking up the real schema later is a small,
+// isolated diff rather than a rewire of every call site.
 package audit
 
 import "github.com/spf13/viper"
