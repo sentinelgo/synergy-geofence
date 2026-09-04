@@ -21,8 +21,9 @@ common:
     # Schema is owned by the DBA (see db/schema/*.sql) — this service never
     # migrates the database itself, so migration.enabled is intentionally
     # left unset rather than wired up here.
-  sidecar:
-    base-url: ${SIDECAR_URL}
+  activity-log:
+    disabled: false
+    address: ${ACTIVITY_LOG_ADDRESS}
   geofence:
     enabled: ${GEOFENCE_AUTH_ENABLED}
     audience: ${GEOFENCE_AUTH_AUDIENCE}
