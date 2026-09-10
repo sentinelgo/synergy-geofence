@@ -112,7 +112,7 @@ type Geofence struct {
 }
 
 func (t *Geofence) TableName() string {
-	return "geofence"
+	return "geofence_rules"
 }
 
 func (t *Geofence) PrimaryKey() uuid.UUID {

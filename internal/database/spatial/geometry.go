@@ -26,10 +26,10 @@ import (
 	"gorm.io/gorm/schema"
 )
 
-// DefaultSRID is Oracle Spatial's long-standing native geodetic WGS84
-// coordinate system (longitude/latitude in degrees, SDO_GTYPE dimensionality
-// 2). Oracle registers this SRID by default in MDSYS.CS_SRS.
-const DefaultSRID = 8307
+// DefaultSRID is the EPSG WGS84 geodetic coordinate system (longitude/latitude
+// in degrees, SDO_GTYPE dimensionality 2) registered for GEOFENCE.GEOMETRY in
+// USER_SDO_GEOM_METADATA. Must stay in sync with that metadata.
+const DefaultSRID = 4326
 
 // earthRadiusMeters is the mean Earth radius (WGS84) used by the spherical
 // direct-geodesic formula in destinationPoint.

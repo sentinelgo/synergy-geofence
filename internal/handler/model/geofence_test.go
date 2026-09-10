@@ -267,3 +267,119 @@ func TestDiffChangedFields_StatusReportedAsFriendlyString(t *testing.T) {
 		t.Errorf(`expected status diff to be the string "deleted", got %v`, changed["status"])
 	}
 }
+
+func existingGeofenceForPatch(t *testing.T) *dbmodel.Geofence {
+	t.Helper()
+	notes := "original notes"
+	clientID := uuid.New()
+	entity := dbmodel.NewGeofence()
+	entity.Name = "Original Name"
+	entity.Status = dbmodel.GeofenceStatusActive
+	entity.ClientID = &clientID
+	entity.Notes = &notes
+	entity.ExcludeFromColocation = false
+	entity.GeoJSON = `{"type":"Circle","coordinates":[-122.4194,37.7749],"radius":100}`
+	entity.Type = dbmodel.GeofenceTypeCircle
+	return entity
+}
+
+func TestPatchGeofenceRequest_ApplyTo_OnlyTouchesProvidedFields(t *testing.T) {
+	entity := existingGeofenceForPatch(t)
+	originalClientID := entity.ClientID
+	originalNotes := entity.Notes
+
+	var req PatchGeofenceRequest
+	if err := json.Unmarshal([]byte(`{"name":"New Name","user_id":"`+uuid.New().String()+`","version":3}`), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	fields, err := req.ApplyTo(entity, spatial.DefaultSRID)
+	if err != nil {
+		t.Fatalf("ApplyTo: %v", err)
+	}
+	if len(fields) != 1 || fields[0] != "name" {
+		t.Fatalf("expected only [name] to be selected, got %v", fields)
+	}
+	if entity.Name != "New Name" {
+		t.Fatalf("expected name to be updated, got %q", entity.Name)
+	}
+	if entity.ClientID != originalClientID {
+		t.Fatalf("expected client_id to be left untouched")
+	}
+	if entity.Notes != originalNotes {
+		t.Fatalf("expected notes to be left untouched")
+	}
+	if entity.Status != dbmodel.GeofenceStatusActive {
+		t.Fatalf("expected status to be left untouched, got %v", entity.Status)
+	}
+}
+
+func TestPatchGeofenceRequest_ApplyTo_ExplicitNullClearsNullableFields(t *testing.T) {
+	entity := existingGeofenceForPatch(t)
+
+	var req PatchGeofenceRequest
+	body := `{"client_id":null,"notes":null,"user_id":"` + uuid.New().String() + `","version":3}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	fields, err := req.ApplyTo(entity, spatial.DefaultSRID)
+	if err != nil {
+		t.Fatalf("ApplyTo: %v", err)
+	}
+	if entity.ClientID != nil {
+		t.Fatalf("expected client_id to be cleared, got %v", entity.ClientID)
+	}
+	if entity.Notes != nil {
+		t.Fatalf("expected notes to be cleared, got %v", entity.Notes)
+	}
+	wantFields := map[string]bool{"client_id": true, "notes": true}
+	if len(fields) != len(wantFields) {
+		t.Fatalf("expected fields %v, got %v", wantFields, fields)
+	}
+	for _, f := range fields {
+		name, _ := f.(string)
+		if !wantFields[name] {
+			t.Errorf("unexpected selected field %q", name)
+		}
+	}
+}
+
+func TestPatchGeofenceRequest_ApplyTo_GeoJsonRebuildsGeometry(t *testing.T) {
+	entity := existingGeofenceForPatch(t)
+
+	var req PatchGeofenceRequest
+	body := `{"geo_json":{"type":"Rectangle","coordinates":[[-122.43,37.77],[-122.41,37.79]]},"user_id":"` + uuid.New().String() + `","version":3}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	fields, err := req.ApplyTo(entity, spatial.DefaultSRID)
+	if err != nil {
+		t.Fatalf("ApplyTo: %v", err)
+	}
+	if entity.Type != dbmodel.GeofenceTypeRectangle {
+		t.Fatalf("expected type to become Rectangle, got %v", entity.Type)
+	}
+	wantFields := map[string]bool{"geo_json": true, "type": true, "geometry": true}
+	if len(fields) != len(wantFields) {
+		t.Fatalf("expected fields %v, got %v", wantFields, fields)
+	}
+	if entity.Name != "Original Name" {
+		t.Fatalf("expected name to be left untouched, got %q", entity.Name)
+	}
+}
+
+func TestPatchGeofenceRequest_ApplyTo_RejectsInvalidNameCharset(t *testing.T) {
+	entity := existingGeofenceForPatch(t)
+
+	var req PatchGeofenceRequest
+	body := `{"name":"Bad/Name","user_id":"` + uuid.New().String() + `","version":3}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if _, err := req.ApplyTo(entity, spatial.DefaultSRID); err == nil || !errors.Is(err, ErrInvalidNameCharset) {
+		t.Fatalf("expected ErrInvalidNameCharset, got %v", err)
+	}
+}

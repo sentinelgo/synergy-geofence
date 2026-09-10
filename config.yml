@@ -2,13 +2,13 @@ version: 1.0.0
 common:
   server:
     host: 0.0.0.0
-    port: 7010
+    port: ${SERVER_PORT}
   datastore:
-    host: localhost
-    port: 1521
-    username: geofence_service
-    password: changeme
-    dbname: geofence.example.oraclevcn.com
+    host: ${ORACLE_HOST}
+    port: ${ORACLE_PORT}
+    username: ${ORACLE_USER}
+    password: "${ORACLE_PASSWORD}"
+    dbname: ${ORACLE_SERVICE_NAME}
     config:
       namingstrategy:
         identifiermaxlength: 128
@@ -18,26 +18,36 @@ common:
         varcharsizeischarlength: true
         namingcasesensitive: true
         sessiontimezone: UTC
-    migration:
-      enabled: true
-  sidecar:
-    base-url: http://localhost:8090
+    # Schema is owned by the DBA (see db/schema/*.sql) — this service never
+    # migrates the database itself, so migration.enabled is intentionally
+    # left unset rather than wired up here.
+  activity-log:
+    disabled: false
+    address: ${ACTIVITY_LOG_ADDRESS}
+  geofence:
+    enabled: ${GEOFENCE_AUTH_ENABLED}
+    audience: ${GEOFENCE_AUTH_AUDIENCE}
+    userinfo-url: ${HYDRA_USERINFO_URL}
   jwt:
     verification:
-      # Disabled for local development so the service runs without a real
-      # IDP; flip to false (and confirm issuers/audiences) per environment
-      # to require and validate bearer tokens.
-      disabled: true
+      # Per environment: true where no real IDP is reachable (local/dev);
+      # false (with the issuers below actually enforced) once an environment
+      # has a real identity provider to validate bearer tokens against.
+      disabled: ${JWT_VERIFICATION_DISABLED}
       ignored:
         - method: "*"
           path: "/health"
+        - method: "*"
+          path: "/swagger(/.*)?"
+        - method: "*"
+          path: "/swagger-doc\\.yaml"
       issuers:
-        - issuer: https://id.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
-        - issuer: https://agency.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
-        - issuer: https://user.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
+        - issuer: https://id.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
+        - issuer: https://agency.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
+        - issuer: https://user.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
   signing:
     verification:
       block-unsigned: false
@@ -45,17 +55,21 @@ common:
       unsigned-paths:
         - method: "*"
           path: "/health"
+        - method: "*"
+          path: "^/swagger(/.*)?$"
+        - method: "*"
+          path: "^/swagger-doc\\.yaml$"
       allowed-issuers:
-        - https://id.dev.sentinelsyn.com
-        - https://user.dev.sentinelsyn.com
-        - https://agency.dev.sentinelsyn.com
+        - https://id.${IDENTITY_DOMAIN}
+        - https://user.${IDENTITY_DOMAIN}
+        - https://agency.${IDENTITY_DOMAIN}
       blacklisted-kids: []
 
 # Event publishing (Apache Pulsar) — see pkg/events. Disabled by default so
 # the service runs without a broker for local development; geofence
 # mutations simply won't be published until this is enabled.
 pulsar:
-  enabled: false
-  service-url: pulsar://localhost:6650
-  topic: persistent://synergy/geofence/events
+  enabled: true
+  service-url: ${PULSAR_URL}
+  topic: persistent://synergy/${ACTIVE_ENVIRONMENT}.geofences/geofence_events
   connection-timeout-seconds: 10

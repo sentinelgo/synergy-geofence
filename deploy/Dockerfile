@@ -28,13 +28,13 @@ RUN mkdir -m 700 /root/.ssh; \
 
 WORKDIR /src
 
-COPY ../go.mod go.sum ./
+COPY go.mod go.sum ./
 
 RUN --mount=type=ssh \
     --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
-COPY .. .
+COPY . .
 
 RUN --mount=type=ssh \
     --mount=type=cache,target=/go/pkg/mod \
@@ -58,7 +58,7 @@ USER geofence
 EXPOSE 7010
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:7010/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:7010/api/v1/health || exit 1
 
 ENTRYPOINT ["/app/service"]
 CMD ["serve"]

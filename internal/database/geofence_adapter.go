@@ -30,8 +30,13 @@ type GeofenceDbAdapter interface {
 	FindByAgencyAndClient(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *model.GeofenceStatus, page, pageSize int) ([]*model.Geofence, int64, error)
 	CreateGeofence(ctx context.Context, g *model.Geofence) error
 	UpdateGeofence(ctx context.Context, g *model.Geofence, selectFields ...any) error
-	// DeleteGeofence soft-deletes (status -> deleted, a terminal state
-	// distinct from Archived) and records userID as the actor in updated_by.
+	// DeleteGeofence hard-deletes the row: DELETE, not a status flip. This
+	// is required so a deleted location's name is immediately free for
+	// reuse within the agency (uni_geofence_agency_name has no status
+	// filter, so a soft-deleted row would keep blocking that name forever).
+	// userID is only used to confirm the geofence still exists before
+	// issuing the delete; it is no longer persisted anywhere since there's
+	// no row left to record it on.
 	DeleteGeofence(ctx context.Context, agencyID, id, userID uuid.UUID) error
 	FindContainingPoint(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, point spatial.Point, srid int) ([]*model.Geofence, error)
 }
@@ -122,7 +127,7 @@ func (dbc *dbAdapter) CreateGeofence(ctx context.Context, g *model.Geofence) err
 	// autoUpdateTime tag only populates it via the normal callback
 	// pipeline, which this raw INSERT bypasses) — set it explicitly,
 	// matching created_at on first insert.
-	query := fmt.Sprintf(`INSERT INTO geofence (
+	query := fmt.Sprintf(`INSERT INTO geofence_rules (
 		id, created_at, updated_at, version, agency_id, client_id, name, type, geometry, geo_json, status,
 		exclude_from_colocation, notes, created_by
 	) VALUES (
@@ -202,7 +207,7 @@ func (dbc *dbAdapter) UpdateGeofence(ctx context.Context, g *model.Geofence, sel
 	setSQL = append(setSQL, "updated_at = :updated_at", "version = :new_version")
 	args = append(args, time.Now().UTC().Truncate(time.Microsecond), newVersion, uuidBytes(g.ID), g.Version)
 
-	query := fmt.Sprintf(`UPDATE geofence SET %s WHERE id = :id AND version = :expected_version`, strings.Join(setSQL, ", "))
+	query := fmt.Sprintf(`UPDATE geofence_rules SET %s WHERE id = :id AND version = :expected_version`, strings.Join(setSQL, ", "))
 
 	err := dbc.WithGormDB(ctx, func(db *gorm.DB) error {
 		result := db.Exec(query, args...)
@@ -222,14 +227,29 @@ func (dbc *dbAdapter) UpdateGeofence(ctx context.Context, g *model.Geofence, sel
 	return nil
 }
 
+// DeleteGeofence issues a real DELETE (see the interface doc comment for
+// why: uni_geofence_agency_name has no status filter, so leaving the row in
+// place under a "deleted" status would keep its name unavailable for reuse
+// within the agency forever). FindByID first both confirms the row exists
+// in this agency (so a bad id/agency pair reports ErrRecordNotFound the
+// same way every other method here does) and rules out the DELETE simply
+// matching zero rows silently.
 func (dbc *dbAdapter) DeleteGeofence(ctx context.Context, agencyID, id, userID uuid.UUID) error {
-	entity, err := dbc.FindByID(ctx, agencyID, id)
-	if err != nil {
+	if _, err := dbc.FindByID(ctx, agencyID, id); err != nil {
 		return err
 	}
-	entity.Status = model.GeofenceStatusDeleted
-	entity.UpdatedBy = &userID
-	return dbc.UpdateGeofence(ctx, entity, "status", "updated_by")
+
+	query := `DELETE FROM geofence_rules WHERE id = :id AND agency_id = :agency_id`
+	return dbc.WithGormDB(ctx, func(db *gorm.DB) error {
+		result := db.Exec(query, uuidBytes(id), uuidBytes(agencyID))
+		if result.Error != nil {
+			return cmodel.ConvertGormErrors(ctx, result, true)
+		}
+		if result.RowsAffected == 0 {
+			return cmodel.ErrRecordNotFound
+		}
+		return nil
+	})
 }
 
 func boolToInt(b bool) int {
@@ -267,7 +287,7 @@ func (dbc *dbAdapter) FindContainingPoint(ctx context.Context, agencyID uuid.UUI
 	query := `SELECT g.id, g.created_at, g.updated_at, g.version,
 	                 g.agency_id, g.client_id, g.name, g.type, g.geo_json, g.status,
 	                 g.exclude_from_colocation, g.notes, g.created_by, g.updated_by
-	          FROM geofence g
+	          FROM geofence_rules g
 	          WHERE g.agency_id = :agency_id
 	            AND g.status = :active_status`
 	args := []interface{}{agencyID, int(model.GeofenceStatusActive)}

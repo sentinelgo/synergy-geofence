@@ -34,12 +34,6 @@ services:
       replicas: ${REPLICA_NUMBER}
       mode: replicated
       placement:
-        # Prod's swarm is a 3-node, manager-only cluster (no workers) — pin the
-        # service to manager nodes explicitly rather than relying on there being
-        # no workers to schedule onto, and keep one replica per node so
-        # REPLICA_NUMBER=3 lands one copy on each of the 3 managers for HA.
-        constraints:
-          - node.role == manager
         max_replicas_per_node: 1
       update_config:
         parallelism: 1

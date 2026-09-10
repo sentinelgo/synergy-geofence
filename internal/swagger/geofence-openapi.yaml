@@ -175,15 +175,16 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
-    put:
-      summary: Update a geofence (optimistic concurrency via version).
+    patch:
+      summary: Partially update a geofence (optimistic concurrency via version).
+      description: Every business field is optional; a field omitted from the request body leaves the existing value untouched. user_id and version are always required.
       tags: [Geofences]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpdateGeofenceRequest'
+              $ref: '#/components/schemas/PatchGeofenceRequest'
       responses:
         '200':
           description: Geofence updated.
@@ -322,6 +323,29 @@ components:
               type: string
               enum: [healthy, unhealthy]
 
+    Address:
+      type: object
+      description: Structured physical address for a geometry.
+      properties:
+        name:
+          type: string
+        street1:
+          type: string
+        street2:
+          type: string
+        city:
+          type: string
+        state_province_id:
+          type: integer
+        state_province:
+          type: string
+        state_province_name:
+          type: string
+        postal_code:
+          type: string
+        country:
+          type: string
+
     GeoJsonPoint:
       type: object
       description: GeoJSON Point geometry.
@@ -340,8 +364,7 @@ components:
           items:
             type: number
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJsonPolygon:
       type: object
@@ -367,8 +390,7 @@ components:
               items:
                 type: number
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJsonCircle:
       type: object
@@ -393,8 +415,7 @@ components:
           description: Radius in meters. Must be > 0 and ≤ configured max limit.
           exclusiveMinimum: 0
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJsonRectangle:
       type: object
@@ -418,8 +439,7 @@ components:
             items:
               type: number
         address:
-          type: string
-          description: Free-text address/label for this geometry.
+          $ref: '#/components/schemas/Address'
 
     GeoJson:
       description: GeoJSON geometry. Coordinates follow [longitude, latitude] order. Discriminate on the type field.
@@ -480,16 +500,48 @@ components:
           nullable: true
           description: Added beyond the original fragment. Free-text notes about this location (e.g. visiting hours, purpose).
 
-    UpdateGeofenceRequest:
-      allOf:
-        - $ref: '#/components/schemas/GeofenceRequest'
-        - type: object
-          required:
-            - version
-          properties:
-            version:
-              type: integer
-              description: Must match the current stored version; a mismatch returns 409 Conflict (optimistic concurrency).
+    PatchGeofenceRequest:
+      type: object
+      description: Partial update — every property below is optional except user_id and version. A property omitted from the request body leaves the geofence's existing value untouched; client_id and notes may be explicitly set to null to clear them.
+      required:
+        - user_id
+        - version
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 150
+          pattern: "^[A-Za-z0-9 '-]+$"
+          description: Letters, digits, spaces, hyphens, and apostrophes only. Must be unique within the agency (409 Conflict on collision).
+        geo_json:
+          $ref: '#/components/schemas/GeoJson'
+          description: Must be Circle, Polygon or Rectangle — Point is not a valid geofence shape. Circle radius must be between 10 and 10000 meters.
+        status:
+          type: string
+          enum: [active, inactive, archived, deleted]
+        user_id:
+          type: string
+          format: uuid
+          description: Identity recorded as updated_by; there is no authentication middleware in front of this API yet.
+        client_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Optional client scoping. Omit to leave unchanged; set to null to clear back to an agency-wide fence.
+        exclude_from_colocation:
+          type: boolean
+          description: |
+            Known Locations feature: circle geofences (parole offices,
+            courthouses, etc.) flagged here are candidates for exclusion
+            from co-location detection reports.
+        notes:
+          type: string
+          maxLength: 500
+          nullable: true
+          description: Free-text notes about this location. Omit to leave unchanged; set to null to clear.
+        version:
+          type: integer
+          description: Must match the current stored version; a mismatch returns 409 Conflict (optimistic concurrency).
 
     Geofence:
       allOf:
