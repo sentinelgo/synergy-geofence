@@ -610,16 +610,18 @@ func formatStringPtr(s *string) string {
 	return *s
 }
 
-// DeleteGeofence handles DELETE: it sets status -> deleted (a terminal
-// state distinct from Archived, which a client can still reach directly via
-// PUT for its own lifecycle purposes). The acting user is supplied by the
-// caller via the required user_id query param and recorded as the row's
-// updated_by; requireAgencyAdmin only verifies the caller is an Agency
-// Admin/System Administrator/Global Administrator for the target agency,
-// not that user_id matches the authenticated subject. That's an accepted
-// tradeoff for the business record and the Pulsar lifecycle event, but not
-// for the audit trail below: see auditActorID/authenticatedUserID, which
-// attribute it to the authenticated subject instead whenever one's
+// DeleteGeofence handles DELETE: it hard-deletes the row (distinct from
+// Archived, which a client can still reach directly via PUT for its own
+// lifecycle purposes) so the Location Name is immediately free for reuse
+// within the agency — see GeofenceDbAdapter.DeleteGeofence's doc comment.
+// The acting user is supplied by the caller via the required user_id query
+// param and used for the Pulsar lifecycle event below (there's no row left
+// to persist it on); requireAgencyAdmin only verifies the caller is an
+// Agency Admin/System Administrator/Global Administrator for the target
+// agency, not that user_id matches the authenticated subject. That's an
+// accepted tradeoff for the business record and the Pulsar lifecycle event,
+// but not for the audit trail below: see auditActorID/authenticatedUserID,
+// which attribute it to the authenticated subject instead whenever one's
 // available.
 func (x *GeofenceController) DeleteGeofence(c *gin.Context) {
 	ctx, span := otelx.StartTracer(gincommon.UnwrapContext(c))
