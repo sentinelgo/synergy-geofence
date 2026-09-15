@@ -214,11 +214,19 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 		items = append(items, resp)
 	}
 
+	pages := 0
+	if pageSize > 0 {
+		pages = int(math.Ceil(float64(total) / float64(pageSize)))
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		pkg.DataKey: items,
-		"total":     total,
-		"page":      page,
-		"page_size": pageSize,
+		"meta": gin.H{
+			"limit": pageSize,
+			"page":  page,
+			"pages": pages,
+			"total": total,
+		},
 	})
 }
 

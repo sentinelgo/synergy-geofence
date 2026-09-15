@@ -575,12 +575,17 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Geofence'
-        total:
-          type: integer
-        page:
-          type: integer
-        page_size:
-          type: integer
+        meta:
+          type: object
+          properties:
+            limit:
+              type: integer
+            page:
+              type: integer
+            pages:
+              type: integer
+            total:
+              type: integer
 
     ErrorDetail:
       type: object
