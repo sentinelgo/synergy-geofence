@@ -33,7 +33,7 @@ common:
     base-url: ${AGENCY_SERVICE_BASE_URL}
     client-credentials:
       client-id: ${GEOFENCE_AGENCY_CLIENT_ID}
-      # A literal file path, not a ${TOKEN} — client-secret is
+      # A literal file path, not a ${...}-style substitution token — client-secret is
       # util.FileOrContent (see synergy-common), which reads this path's
       # content when it exists on disk rather than treating the string as
       # inline content. The file is a dedicated Docker secret (see
