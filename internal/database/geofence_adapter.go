@@ -27,7 +27,11 @@ type GeofenceDbAdapter interface {
 	// scoped further to a client). When status is nil it excludes
 	// GeofenceStatusDeleted by default (deleted rows only surface when
 	// explicitly requested via status).
-	FindByAgencyAndClient(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *model.GeofenceStatus, page, pageSize int) ([]*model.Geofence, int64, error)
+	// textQuery, if provided, performs an Oracle Text CONTAINS search against
+	// name and geo_json. agencyIDs, if non-empty, is used as the agency_id
+	// IN (...) list (used to include subagencies). page/pageSize are used
+	// for pagination.
+	FindByAgencyAndClient(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *model.GeofenceStatus, page, pageSize int, textQuery string, agencyIDs []uuid.UUID) ([]*model.Geofence, int64, error)
 	CreateGeofence(ctx context.Context, g *model.Geofence) error
 	UpdateGeofence(ctx context.Context, g *model.Geofence, selectFields ...any) error
 	// DeleteGeofence hard-deletes the row: DELETE, not a status flip. This
@@ -77,7 +81,7 @@ func (dbc *dbAdapter) FindByID(ctx context.Context, agencyID, id uuid.UUID) (*mo
 	return entity, nil
 }
 
-func (dbc *dbAdapter) FindByAgencyAndClient(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *model.GeofenceStatus, page, pageSize int) ([]*model.Geofence, int64, error) {
+func (dbc *dbAdapter) FindByAgencyAndClient(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *model.GeofenceStatus, page, pageSize int, textQuery string, agencyIDs []uuid.UUID) ([]*model.Geofence, int64, error) {
 	entities := make([]*model.Geofence, 0)
 	var total int64
 
@@ -89,7 +93,13 @@ func (dbc *dbAdapter) FindByAgencyAndClient(ctx context.Context, agencyID uuid.U
 	}
 
 	err := dbc.WithGormDB(ctx, func(db *gorm.DB) error {
-		q := db.Model(&model.Geofence{}).Where("agency_id = ?", agencyID)
+		q := db.Model(&model.Geofence{})
+		// agency filter: either IN (subagencies) or single agency
+		if len(agencyIDs) > 0 {
+			q = q.Where("agency_id IN ?", agencyIDs)
+		} else {
+			q = q.Where("agency_id = ?", agencyID)
+		}
 		if clientID != nil {
 			q = q.Where("client_id = ?", *clientID)
 		}
@@ -98,6 +108,13 @@ func (dbc *dbAdapter) FindByAgencyAndClient(ctx context.Context, agencyID uuid.U
 		} else {
 			q = q.Where("status != ?", int(model.GeofenceStatusDeleted))
 		}
+
+		// textQuery uses Oracle Text CONTAINS against name and geo_json
+		if strings.TrimSpace(textQuery) != "" {
+			// CONTAINS returns a score > 0 when matched; search both name and geo_json
+			q = q.Where("(CONTAINS(name, ?) > 0 OR CONTAINS(geo_json, ?) > 0)", textQuery, textQuery)
+		}
+
 		if err := q.Session(&gorm.Session{}).Count(&total).Error; err != nil {
 			return err
 		}

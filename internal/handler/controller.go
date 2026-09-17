@@ -194,9 +194,30 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 		status = &s
 	}
 
+	// text search (Oracle Text CONTAINS against name and geo_json)
+	textQuery := strings.TrimSpace(c.Query("q"))
+
+	// optional agency_ids (comma-separated UUIDs) to include subagencies
+	var agencyIDs []uuid.UUID
+	if raw := strings.TrimSpace(c.Query("agency_ids")); raw != "" {
+		parts := strings.Split(raw, ",")
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			id, perr := uuid.Parse(p)
+			if perr != nil {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrUUIDParse, "agency_ids")})
+				return
+			}
+			agencyIDs = append(agencyIDs, id)
+		}
+	}
+
 	page, pageSize := parsePagination(c)
 
-	entities, total, err := x.datasource.FindByAgencyAndClient(c, agencyID, clientID, status, page, pageSize)
+	entities, total, err := x.datasource.FindByAgencyAndClient(c, agencyID, clientID, status, page, pageSize, textQuery, agencyIDs)
 	if err != nil {
 		l.With(pkg.ErrorKey, err.Error()).Error("failed to list geofences")
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrGeofenceFind, localerrors.Geofence)})
