@@ -5,6 +5,7 @@ go 1.25.6
 require (
 	github.com/apache/pulsar-client-go v0.18.0
 	github.com/auth0/go-jwt-middleware/v3 v3.2.0
+	github.com/dgraph-io/ristretto v0.2.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/sentinelgo/synergy-common v1.30.0
@@ -49,6 +50,7 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/emirpasic/gods/v2 v2.0.0-alpha // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect

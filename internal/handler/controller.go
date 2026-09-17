@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dgraph-io/ristretto"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	pkg "github.com/sentinelgo/synergy-geofence/internal"
@@ -21,6 +22,7 @@ import (
 	localerrors "github.com/sentinelgo/synergy-geofence/internal/errors"
 	"github.com/sentinelgo/synergy-geofence/internal/events"
 	hmodel "github.com/sentinelgo/synergy-geofence/internal/handler/model"
+	"github.com/sentinelgo/synergy-geofence/internal/search"
 
 	activitylogger "github.com/sentinelgo/synergy-common/pkg/activity-logger"
 	"github.com/sentinelgo/synergy-common/pkg/config"
@@ -41,10 +43,25 @@ type GeofenceController struct {
 	cfg         *config.Config
 	publisher   events.Publisher
 	activityLog activitylogger.Logger
+	// m2mAcli is a client_credentials-authenticated *http.Client (see
+	// config.ClientCredentialsConfig.Client) used for every agency-service
+	// m2m call (FetchHierarchy, FetchAgencyDetails) — nil if
+	// common.agency.client-credentials isn't configured, in which case
+	// those calls fail gracefully (see resolveListAgencyIDs/resolveHomeAgency)
+	// rather than the service failing to start.
+	m2mAcli         *http.Client
+	homeAgencyCache *ristretto.Cache
 }
 
-func NewGeofenceController(datasource database.GeofenceDbAdapter, cfg *config.Config, publisher events.Publisher, activityLog activitylogger.Logger) *GeofenceController {
-	return &GeofenceController{datasource: datasource, cfg: cfg, publisher: publisher, activityLog: activityLog}
+func NewGeofenceController(datasource database.GeofenceDbAdapter, cfg *config.Config, publisher events.Publisher, activityLog activitylogger.Logger, m2mAcli *http.Client) *GeofenceController {
+	return &GeofenceController{
+		datasource:      datasource,
+		cfg:             cfg,
+		publisher:       publisher,
+		activityLog:     activityLog,
+		m2mAcli:         m2mAcli,
+		homeAgencyCache: newHomeAgencyCache(),
+	}
 }
 
 // auditActorID is the identity an audit event's Actor is attributed to:
@@ -84,7 +101,7 @@ func (x *GeofenceController) CreateGeofence(c *gin.Context) {
 		return
 	}
 
-	if err = x.datasource.CreateGeofence(c, entity); err != nil {
+	if err = x.datasource.CreateGeofence(c, entity, x.resolveHomeAgency(c, agencyID)); err != nil {
 		if errors.Is(err, cmodel.ErrDuplicateRecord) {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrDuplicate, localerrors.Name)})
 			return
@@ -176,56 +193,75 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 	l := log.LoggerFromContext(c)
 	agencyID := pkg.AgencyID(c)
 
-	clientID, err := parseOptionalUUIDQuery(c, "client_id")
+	// buildGeofenceListFilters accepts either a JSON body (search/pagination/
+	// data envelope, mirroring sso-user-service's LIST-body contract) or
+	// today's query-string params — a body is used only when present and
+	// recognizable; otherwise every field falls back to its query param.
+	filters, badField, err := buildGeofenceListFilters(c)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrUUIDParse, localerrors.ClientId)})
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: listFilterFieldError(badField)})
 		return
 	}
 
-	// No status filter defaults to "everything except deleted" — see
-	// FindByAgencyAndClient's doc comment.
-	var status *dbmodel.GeofenceStatus
-	if raw := c.Query("status"); raw != "" {
-		s := hmodel.StatusToDB(raw)
-		if !s.Valid() {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrMismatch, localerrors.Geofence)})
+	// An explicit agency_ids list means the caller already resolved the
+	// subagency scope (e.g. from a prior hierarchy lookup) — use it as-is
+	// rather than re-resolving via resolveListAgencyIDs.
+	agencyIDs := filters.agencyIDs
+	if agencyIDs == nil {
+		agencyIDs, err = x.resolveListAgencyIDs(c, agencyID, filters.includeSubagency)
+		if err != nil {
+			l.With("error", err).Error("failed to resolve list agency scope")
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrAuth, localerrors.AgencyId)})
 			return
 		}
-		status = &s
 	}
 
-	// text search (Oracle Text CONTAINS against name and geo_json)
-	textQuery := strings.TrimSpace(c.Query("q"))
-
-	// optional agency_ids (comma-separated UUIDs) to include subagencies
-	var agencyIDs []uuid.UUID
-	if raw := strings.TrimSpace(c.Query("agency_ids")); raw != "" {
-		parts := strings.Split(raw, ",")
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			id, perr := uuid.Parse(p)
-			if perr != nil {
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrUUIDParse, "agency_ids")})
-				return
-			}
-			agencyIDs = append(agencyIDs, id)
-		}
-	}
-
-	page, pageSize := parsePagination(c)
-
-	entities, total, err := x.datasource.FindByAgencyAndClient(c, agencyID, clientID, status, page, pageSize, textQuery, agencyIDs)
+	// FindByAgencyAndClient only applies structural filters (agency/client/
+	// status) — search, sort, and pagination all happen here in memory over
+	// the full result set, the same fetch-broadly-then-filter/sort/
+	// paginate-in-Go pattern sso-agency-service's search already uses,
+	// rather than an Oracle Text index or SQL ORDER BY/LIMIT.
+	entities, err := x.datasource.FindByAgencyAndClient(c, agencyID, filters.clientID, filters.status, agencyIDs)
 	if err != nil {
 		l.With(pkg.ErrorKey, err.Error()).Error("failed to list geofences")
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrGeofenceFind, localerrors.Geofence)})
 		return
 	}
 
-	items := make([]*hmodel.Geofence, 0, len(entities))
+	matched := make([]*dbmodel.Geofence, 0, len(entities))
 	for _, entity := range entities {
+		var homeAgency string
+		if entity.SynergyIdentifier != nil {
+			homeAgency = *entity.SynergyIdentifier
+		}
+		if search.MatchesQuery(entity, homeAgency, filters.query) {
+			matched = append(matched, entity)
+		}
+	}
+
+	sortGeofences(matched, filters.sortField, filters.order)
+
+	total := len(matched)
+	pages := 0
+	if filters.pageSize > 0 {
+		pages = int(math.Ceil(float64(total) / float64(filters.pageSize)))
+	}
+
+	start := (filters.page - 1) * filters.pageSize
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	end := start + filters.pageSize
+	if filters.pageSize <= 0 || end > total {
+		end = total
+	}
+	paged := matched[start:end]
+
+	items := make([]*hmodel.Geofence, 0, len(paged))
+	for _, entity := range paged {
 		resp, ferr := hmodel.FromModel(entity)
 		if ferr != nil {
 			l.With("error", ferr).Error("failed to build geofence response")
@@ -235,20 +271,85 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 		items = append(items, resp)
 	}
 
-	pages := 0
-	if pageSize > 0 {
-		pages = int(math.Ceil(float64(total) / float64(pageSize)))
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		pkg.DataKey: items,
 		"meta": gin.H{
-			"limit": pageSize,
-			"page":  page,
+			"limit": filters.pageSize,
+			"page":  filters.page,
 			"pages": pages,
 			"total": total,
 		},
 	})
+}
+
+func (x *GeofenceController) resolveListAgencyIDs(
+	c *gin.Context,
+	agencyID uuid.UUID,
+	includeSubagency bool,
+) ([]uuid.UUID, error) {
+	if !includeSubagency {
+		return []uuid.UUID{agencyID}, nil
+	}
+
+	claims := pkg.Claims(c)
+	svc := serviceClaims(claims)
+
+	if svc == nil {
+		abortForbidden(c, claims, pkg.AgencyID(c))
+		return nil, nil
+	}
+
+	client, err := newAgencyClient(x.cfg, x.m2mAcli, x.homeAgencyCache)
+	if err != nil {
+		return nil, err
+	}
+
+	rawIDs, err := client.FetchHierarchy(c, agencyID)
+	if err != nil {
+		return nil, err
+	}
+
+	isAdmin := svc.IsSystemAdmin() ||
+		svc.IsGlobalAdmin() ||
+		svc.IsReadOnlyAdmin()
+
+	agencyIDs := make([]uuid.UUID, 0, len(rawIDs)+1)
+	agencyIDs = append(agencyIDs, agencyID)
+
+	agencyIDs = append(agencyIDs, UniqueBy(rawIDs, func(id uuid.UUID) (uuid.UUID, bool) {
+		if id == uuid.Nil {
+			return uuid.Nil, false
+		}
+		if isAdmin {
+			return id, true
+		}
+
+		return id, svc.MetadataPublic.Association(id.String()) != ""
+	})...,
+	)
+	return agencyIDs, nil
+}
+
+// resolveHomeAgency best-effort looks up the owning agency's
+// synergy_identifier for search/sort under ListGeofences' "home_agency"
+// field (see search.MatchesQuery and list_sort.go). A lookup failure never
+// fails the create/update request — same as Pulsar publish being
+// best-effort elsewhere in this handler — it only means that one
+// geofence's home_agency won't reflect it until the next update that
+// resolves successfully.
+func (x *GeofenceController) resolveHomeAgency(c *gin.Context, agencyID uuid.UUID) string {
+	l := log.LoggerFromContext(c)
+	client, err := newAgencyClient(x.cfg, x.m2mAcli, x.homeAgencyCache)
+	if err != nil {
+		l.With("error", err).Warn("could not build agency client, home agency will not be indexed")
+		return ""
+	}
+	homeAgency, err := client.FetchAgencyDetails(c, agencyID)
+	if err != nil {
+		l.With("error", err).Warn("could not resolve home agency, home agency will not be indexed")
+		return ""
+	}
+	return homeAgency
 }
 
 func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
@@ -300,7 +401,7 @@ func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
 	// the optimistic-concurrency check could never fail.
 	entity.Version = req.Version
 
-	if err = x.datasource.UpdateGeofence(c, entity, selectFields...); err != nil {
+	if err = x.datasource.UpdateGeofence(c, entity, x.resolveHomeAgency(c, agencyID), selectFields...); err != nil {
 		if errors.Is(err, cmodel.ErrOptimisticLock) {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrOptimisticLock, localerrors.Geofence)})
 			return

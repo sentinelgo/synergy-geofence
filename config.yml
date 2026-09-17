@@ -24,6 +24,28 @@ common:
   activity-log:
     disabled: false
     address: ${ACTIVITY_LOG_ADDRESS}
+  # Used for every agency-service m2m call (subagency hierarchy lookup,
+  # home-agency profile — see internal/handler/agency_client.go). The
+  # client-credentials client is a confidential Hydra client, one per
+  # environment, using client_secret_basic (auth-style: in-header) with
+  # agency.read as its only allowed scope.
+  agency:
+    base-url: ${AGENCY_SERVICE_BASE_URL}
+    client-credentials:
+      client-id: ${GEOFENCE_AGENCY_CLIENT_ID}
+      # A literal file path, not a ${TOKEN} — client-secret is
+      # util.FileOrContent (see synergy-common), which reads this path's
+      # content when it exists on disk rather than treating the string as
+      # inline content. The file is a dedicated Docker secret (see
+      # deploy/docker-stack*.yml's geofence_agency_client_secret secret and
+      # the Jenkinsfiles' "Create Agency Client Secret" stage) pulled from
+      # Vault at deploy time and mounted here — unlike every other value in
+      # this file, it's never baked into the geofence_config secret/rendered
+      # config.yml, and never passed as a container environment variable.
+      client-secret: /run/secrets/geofence_agency_client_secret
+      token-url: ${HYDRA_TOKEN_URL}
+      scopes: ["agency.read"]
+      auth-style: in-header
   geofence:
     enabled: ${GEOFENCE_AUTH_ENABLED}
     audience: ${GEOFENCE_AUTH_AUDIENCE}

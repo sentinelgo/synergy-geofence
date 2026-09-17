@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,26 +30,31 @@ import (
 type fakeGeofenceDbAdapter struct {
 	database.GeofenceDbAdapter
 
-	findByID func(ctx context.Context, agencyID, id uuid.UUID) (*dbmodel.Geofence, error)
-	update   func(ctx context.Context, g *dbmodel.Geofence, selectFields ...any) error
-	create   func(ctx context.Context, g *dbmodel.Geofence) error
-	delete_  func(ctx context.Context, agencyID, id, userID uuid.UUID) error
+	findByID              func(ctx context.Context, agencyID, id uuid.UUID) (*dbmodel.Geofence, error)
+	findByAgencyAndClient func(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *dbmodel.GeofenceStatus, agencyIDs []uuid.UUID) ([]*dbmodel.Geofence, error)
+	update                func(ctx context.Context, g *dbmodel.Geofence, homeAgency string, selectFields ...any) error
+	create                func(ctx context.Context, g *dbmodel.Geofence, homeAgency string) error
+	delete_               func(ctx context.Context, agencyID, id, userID uuid.UUID) error
 }
 
 func (f *fakeGeofenceDbAdapter) FindByID(ctx context.Context, agencyID, id uuid.UUID) (*dbmodel.Geofence, error) {
 	return f.findByID(ctx, agencyID, id)
 }
 
-func (f *fakeGeofenceDbAdapter) UpdateGeofence(ctx context.Context, g *dbmodel.Geofence, selectFields ...any) error {
-	return f.update(ctx, g, selectFields...)
+func (f *fakeGeofenceDbAdapter) UpdateGeofence(ctx context.Context, g *dbmodel.Geofence, homeAgency string, selectFields ...any) error {
+	return f.update(ctx, g, homeAgency, selectFields...)
 }
 
-func (f *fakeGeofenceDbAdapter) CreateGeofence(ctx context.Context, g *dbmodel.Geofence) error {
-	return f.create(ctx, g)
+func (f *fakeGeofenceDbAdapter) CreateGeofence(ctx context.Context, g *dbmodel.Geofence, homeAgency string) error {
+	return f.create(ctx, g, homeAgency)
 }
 
 func (f *fakeGeofenceDbAdapter) DeleteGeofence(ctx context.Context, agencyID, id, userID uuid.UUID) error {
 	return f.delete_(ctx, agencyID, id, userID)
+}
+
+func (f *fakeGeofenceDbAdapter) FindByAgencyAndClient(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *dbmodel.GeofenceStatus, agencyIDs []uuid.UUID) ([]*dbmodel.Geofence, error) {
+	return f.findByAgencyAndClient(ctx, agencyID, clientID, status, agencyIDs)
 }
 
 var _ database.GeofenceDbAdapter = (*fakeGeofenceDbAdapter)(nil)
@@ -89,7 +95,7 @@ func newTestGinContext(t *testing.T, method, target, body string, params gin.Par
 }
 
 func newTestController(datasource database.GeofenceDbAdapter, activityLog activitylogger.Logger) *GeofenceController {
-	return NewGeofenceController(datasource, &config.Config{}, events.NoopPublisher{}, activityLog)
+	return NewGeofenceController(datasource, &config.Config{}, events.NoopPublisher{}, activityLog, http.DefaultClient)
 }
 
 // TestUpdateGeofence_RadiusChangeOnly_AuditsRadiusField is the end-to-end
@@ -124,7 +130,7 @@ func TestUpdateGeofence_RadiusChangeOnly_AuditsRadiusField(t *testing.T) {
 			cp := *existing
 			return &cp, nil
 		},
-		update: func(_ context.Context, g *dbmodel.Geofence, _ ...any) error {
+		update: func(_ context.Context, g *dbmodel.Geofence, _ string, _ ...any) error {
 			return nil
 		},
 	}
@@ -184,7 +190,7 @@ func TestUpdateGeofence_ExcludeFromColocationOnly_AuditsExcludedCategory(t *test
 			cp := *existing
 			return &cp, nil
 		},
-		update: func(context.Context, *dbmodel.Geofence, ...any) error { return nil },
+		update: func(context.Context, *dbmodel.Geofence, string, ...any) error { return nil },
 	}
 	activityLog := &fakeActivityLogger{}
 	ctrl := newTestController(datasource, activityLog)
@@ -221,7 +227,7 @@ func TestCreateGeofence_AuditsAddedCategory(t *testing.T) {
 	agencyID := uuid.New()
 
 	datasource := &fakeGeofenceDbAdapter{
-		create: func(_ context.Context, g *dbmodel.Geofence) error { return nil },
+		create: func(_ context.Context, g *dbmodel.Geofence, _ string) error { return nil },
 	}
 	activityLog := &fakeActivityLogger{}
 	ctrl := newTestController(datasource, activityLog)
@@ -274,5 +280,376 @@ func TestDeleteGeofence_AuditsDeletedCategory(t *testing.T) {
 	}
 	if got := activityLog.reqs[0].GetCategory(); got != pb.EventCategory_AGENCY_KNOWN_LOCATION_DELETED {
 		t.Errorf("Category = %v, want AGENCY_KNOWN_LOCATION_DELETED", got)
+	}
+}
+
+// listResponse mirrors ListGeofences' JSON envelope (pkg.DataKey: items,
+// "meta": {...}) — just enough of it for these tests to assert on names,
+// ordering, and the reported total.
+type listResponse struct {
+	Data []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"data"`
+	Meta struct {
+		Total int `json:"total"`
+		Page  int `json:"page"`
+		Limit int `json:"limit"`
+		Pages int `json:"pages"`
+	} `json:"meta"`
+}
+
+func decodeListResponse(t *testing.T, w *httptest.ResponseRecorder) listResponse {
+	t.Helper()
+	var resp listResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v; body = %s", err, w.Body.String())
+	}
+	return resp
+}
+
+func namedGeofence(agencyID uuid.UUID, name string) *dbmodel.Geofence {
+	g := &dbmodel.Geofence{
+		MutableModel: dbmodel.DefaultMutableModel(),
+		AgencyID:     agencyID,
+		Name:         name,
+		Type:         dbmodel.GeofenceTypeCircle,
+		GeoJSON:      `{"type":"Circle","coordinates":[-84.388,33.749],"radius":500}`,
+		Status:       dbmodel.GeofenceStatusActive,
+	}
+	g.ID = uuid.New()
+	return g
+}
+
+// TestListGeofences_FiltersByAgencyClientScopeAndSearch confirms
+// FindByAgencyAndClient is invoked with only the structural filters
+// (agency/client/status/agencyIDs — no page/sort/query, which are now
+// applied entirely in memory afterward, see ListGeofences), and that the
+// free-text query param actually narrows the response to matching rows.
+func TestListGeofences_FiltersByAgencyClientScopeAndSearch(t *testing.T) {
+	agencyID := uuid.New()
+	clientID := uuid.New()
+	agencyFilter := []uuid.UUID{uuid.New(), uuid.New()}
+
+	match := namedGeofence(agencyID, "Downtown Office")
+	noMatch := namedGeofence(agencyID, "Uptown Depot")
+
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(_ context.Context, gotAgencyID uuid.UUID, gotClientID *uuid.UUID, gotStatus *dbmodel.GeofenceStatus, gotAgencyIDs []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			if gotAgencyID != agencyID {
+				t.Fatalf("agencyID = %v, want %v", gotAgencyID, agencyID)
+			}
+			if gotClientID == nil || *gotClientID != clientID {
+				t.Fatalf("clientID = %v, want %v", gotClientID, clientID)
+			}
+			if gotStatus != nil {
+				t.Fatalf("status = %v, want nil", gotStatus)
+			}
+			if len(gotAgencyIDs) != len(agencyFilter) {
+				t.Fatalf("agencyIDs = %v, want %v", gotAgencyIDs, agencyFilter)
+			}
+			for i := range agencyFilter {
+				if gotAgencyIDs[i] != agencyFilter[i] {
+					t.Fatalf("agencyIDs[%d] = %v, want %v", i, gotAgencyIDs[i], agencyFilter[i])
+				}
+			}
+			return []*dbmodel.Geofence{match, noMatch}, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet,
+		"/agencies/"+agencyID.String()+"/geofences?q=Downtown&client_id="+clientID.String()+"&includeSubagency=true&agency_ids="+agencyFilter[0].String()+","+agencyFilter[1].String(),
+		"",
+		nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	resp := decodeListResponse(t, w)
+	if resp.Meta.Total != 1 || len(resp.Data) != 1 || resp.Data[0].Name != "Downtown Office" {
+		t.Fatalf("got %+v, want exactly one match named %q", resp, "Downtown Office")
+	}
+}
+
+// TestListGeofences_ShortQueryMatchesNothing mirrors sso-agency-service's
+// buildSearchCriteria: a query shorter than search.MinQueryLen (3) is an
+// invalid search — a 200 with zero results, not a match-everything
+// fallback and not a 400.
+func TestListGeofences_ShortQueryMatchesNothing(t *testing.T) {
+	agencyID := uuid.New()
+	match := namedGeofence(agencyID, "Downtown Office")
+
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			return []*dbmodel.Geofence{match}, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences?q=Do", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	resp := decodeListResponse(t, w)
+	if resp.Meta.Total != 0 || len(resp.Data) != 0 {
+		t.Fatalf("got %+v, want zero results for a query shorter than MinQueryLen", resp)
+	}
+}
+
+// TestListGeofences_SearchMatchesExcludeFromColocation confirms
+// exclude_from_colocation is searchable as plain "true"/"false" text (see
+// search.MatchesQuery), not just sortable/filterable.
+func TestListGeofences_SearchMatchesExcludeFromColocation(t *testing.T) {
+	agencyID := uuid.New()
+	excluded := namedGeofence(agencyID, "Parole Office")
+	excluded.ExcludeFromColocation = true
+	included := namedGeofence(agencyID, "Downtown Office")
+	included.ExcludeFromColocation = false
+
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			return []*dbmodel.Geofence{excluded, included}, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences?q=true", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	resp := decodeListResponse(t, w)
+	if resp.Meta.Total != 1 || len(resp.Data) != 1 || resp.Data[0].Name != "Parole Office" {
+		t.Fatalf("got %+v, want exactly one match named %q", resp, "Parole Office")
+	}
+}
+
+func TestListGeofences_RejectsInvalidAgencyIDs(t *testing.T) {
+	agencyID := uuid.New()
+	called := false
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences?includeSubagency=true&agency_ids=not-a-uuid", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatal("datasource should not be called for invalid agency_ids")
+	}
+}
+
+// TestListGeofences_SortsByHomeAgency confirms sort_by/order are applied in
+// memory, over the DB layer's unsorted result set, rather than being passed
+// through to it.
+func TestListGeofences_SortsByHomeAgency(t *testing.T) {
+	agencyID := uuid.New()
+	idA, idZ := "AAA", "ZZZ"
+
+	gA := namedGeofence(agencyID, "A")
+	gA.SynergyIdentifier = &idA
+	gZ := namedGeofence(agencyID, "Z")
+	gZ.SynergyIdentifier = &idZ
+
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			return []*dbmodel.Geofence{gA, gZ}, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet,
+		"/agencies/"+agencyID.String()+"/geofences?sort_by=home_agency&order=DESC", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	resp := decodeListResponse(t, w)
+	if len(resp.Data) != 2 || resp.Data[0].Name != "Z" || resp.Data[1].Name != "A" {
+		t.Fatalf("got order %+v, want [Z, A] (desc by home_agency)", resp.Data)
+	}
+}
+
+// TestListGeofences_AcceptsBodyRequest exercises the LIST-body envelope
+// (mirroring sso-user-service's UserListRequest): search/pagination/data
+// all supplied in the JSON body instead of query params, on the same route
+// that otherwise reads query strings. FindByAgencyAndClient only receives
+// the structural filters (status, resolved agencyIDs) — search/sort/
+// pagination from the body are all applied afterward in memory.
+func TestListGeofences_AcceptsBodyRequest(t *testing.T) {
+	agencyID := uuid.New()
+
+	matchB := namedGeofence(agencyID, "Downtown Office B")
+	matchA := namedGeofence(agencyID, "Downtown Office A")
+	noMatch := namedGeofence(agencyID, "Uptown Depot")
+
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(_ context.Context, gotAgencyID uuid.UUID, gotClientID *uuid.UUID, gotStatus *dbmodel.GeofenceStatus, gotAgencyIDs []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			if gotAgencyID != agencyID {
+				t.Fatalf("agencyID = %v, want %v", gotAgencyID, agencyID)
+			}
+			if gotClientID != nil {
+				t.Fatalf("clientID = %v, want nil (not a body field)", gotClientID)
+			}
+			if gotStatus == nil || *gotStatus != dbmodel.GeofenceStatusActive {
+				t.Fatalf("status = %v, want active", gotStatus)
+			}
+			// include_subagency isn't set in this request, so agencyIDs
+			// resolves to just the path's own agency (no hierarchy lookup).
+			if len(gotAgencyIDs) != 1 || gotAgencyIDs[0] != agencyID {
+				t.Fatalf("agencyIDs = %v, want [%v]", gotAgencyIDs, agencyID)
+			}
+			return []*dbmodel.Geofence{matchB, matchA, noMatch}, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	body := `{
+		"search": {"any": "Downtown Office"},
+		"pagination": {"limit": 50, "page": 1},
+		"data": {
+			"status": "active",
+			"sort_by": "name",
+			"order": "asc"
+		}
+	}`
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences", body, nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	resp := decodeListResponse(t, w)
+	if resp.Meta.Total != 2 || len(resp.Data) != 2 ||
+		resp.Data[0].Name != "Downtown Office A" || resp.Data[1].Name != "Downtown Office B" {
+		t.Fatalf("got %+v, want [Downtown Office A, Downtown Office B] sorted asc, excluding Uptown Depot", resp.Data)
+	}
+}
+
+// TestListGeofences_FallsBackToQueryWhenBodyLacksEnvelopeKeys confirms a
+// JSON body that isn't the search/pagination/data envelope (e.g. some
+// unrelated payload, or one sent by mistake) doesn't get treated as a list
+// request body — ListGeofences still reads query params (and applies their
+// sort) in that case.
+func TestListGeofences_FallsBackToQueryWhenBodyLacksEnvelopeKeys(t *testing.T) {
+	agencyID := uuid.New()
+
+	gZ := namedGeofence(agencyID, "Zeta")
+	gA := namedGeofence(agencyID, "Alpha")
+
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			return []*dbmodel.Geofence{gZ, gA}, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet,
+		"/agencies/"+agencyID.String()+"/geofences?sort_by=name", `{"unrelated":"payload"}`, nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	resp := decodeListResponse(t, w)
+	if len(resp.Data) != 2 || resp.Data[0].Name != "Alpha" || resp.Data[1].Name != "Zeta" {
+		t.Fatalf("got order %+v, want [Alpha, Zeta] (query fallback sort_by=name)", resp.Data)
+	}
+}
+
+func TestListGeofences_RejectsInvalidBodySortBy(t *testing.T) {
+	agencyID := uuid.New()
+	called := false
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	body := `{"data": {"sort_by": "bogus"}}`
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences", body, nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatal("datasource should not be called for an invalid body sort_by")
+	}
+}
+
+func TestListGeofences_RejectsMalformedBody(t *testing.T) {
+	agencyID := uuid.New()
+	called := false
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	body := `{"data": `
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences", body, nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatal("datasource should not be called for a malformed body")
+	}
+}
+
+func TestListGeofences_RejectsInvalidSortBy(t *testing.T) {
+	agencyID := uuid.New()
+	called := false
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences?sort_by=bogus", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatal("datasource should not be called for an invalid sort_by")
 	}
 }

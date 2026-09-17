@@ -11,6 +11,11 @@ services:
         uid: "1000"
         gid: "1000"
         mode: 0440
+      - source: geofence_agency_client_secret
+        target: /run/secrets/geofence_agency_client_secret
+        uid: "1000"
+        gid: "1000"
+        mode: 0440
     networks:
       - geofence-net
     extra_hosts:
@@ -30,6 +35,9 @@ services:
       - GEOFENCE_AUTH_ENABLED=${GEOFENCE_AUTH_ENABLED:-true}
       - GEOFENCE_AUTH_AUDIENCE=${GEOFENCE_AUTH_AUDIENCE}
       - HYDRA_USERINFO_URL=${HYDRA_USERINFO_URL}
+      - AGENCY_SERVICE_BASE_URL=${AGENCY_SERVICE_BASE_URL}
+      - GEOFENCE_AGENCY_CLIENT_ID=${GEOFENCE_AGENCY_CLIENT_ID}
+      - HYDRA_TOKEN_URL=${HYDRA_TOKEN_URL}
     deploy:
       replicas: ${REPLICA_NUMBER}
       mode: replicated
@@ -81,3 +89,6 @@ secrets:
   geofence_config:
     external: true
     name: ${CONFIG_SECRET:-geofence_config}
+  geofence_agency_client_secret:
+    external: true
+    name: ${AGENCY_CLIENT_SECRET_NAME:-geofence_agency_client_secret}

@@ -90,25 +90,27 @@ func (s GeofenceStatus) Valid() bool {
 type Geofence struct {
 	MutableModel `mapstructure:",squash,omitempty"`
 
-	AgencyID uuid.UUID        `json:"agency_id" gorm:"column:agency_id;type:uuid;not null;index:idx_geofence_agency_client,priority:1;uniqueIndex:uni_geofence_agency_name,priority:1" mapstructure:"agency_id"`
-	ClientID *uuid.UUID       `json:"client_id,omitempty" gorm:"column:client_id;type:uuid;index:idx_geofence_agency_client,priority:2" mapstructure:"client_id"`
-	Name     string           `json:"name" gorm:"column:name;type:varchar2;size:150;not null;uniqueIndex:uni_geofence_agency_name,priority:2" mapstructure:"name"`
-	Type     GeofenceType     `json:"type" gorm:"column:type;type:numeric;not null;check:chk_geofence_type,type IN (1,2,3)" mapstructure:"type"`
-	Geometry spatial.Geometry `json:"-" gorm:"column:geometry;type:MDSYS.SDO_GEOMETRY;not null;->:false;<-:create,update" mapstructure:"-"`
-	GeoJSON  string           `json:"-" gorm:"column:geo_json;type:clob;not null" mapstructure:"-"`
-	Status   GeofenceStatus   `json:"status" gorm:"column:status;type:numeric;not null;default:1;index:idx_geofence_agency_client,priority:3;check:chk_geofence_status,status IN (1,2,3,4)" mapstructure:"status"`
+	AgencyID              uuid.UUID        `json:"agency_id" gorm:"column:agency_id;type:uuid;not null;index:idx_geofence_agency_client,priority:1;uniqueIndex:uni_geofence_agency_name,priority:1" mapstructure:"agency_id"`
+	ClientID              *uuid.UUID       `json:"client_id,omitempty" gorm:"column:client_id;type:uuid;index:idx_geofence_agency_client,priority:2" mapstructure:"client_id"`
+	Name                  string           `json:"name" gorm:"column:name;type:varchar2;size:150;not null;uniqueIndex:uni_geofence_agency_name,priority:2" mapstructure:"name"`
+	Type                  GeofenceType     `json:"type" gorm:"column:type;type:numeric;not null;check:chk_geofence_type,type IN (1,2,3)" mapstructure:"type"`
+	Geometry              spatial.Geometry `json:"-" gorm:"column:geometry;type:MDSYS.SDO_GEOMETRY;not null;->:false;<-:create,update" mapstructure:"-"`
+	GeoJSON               string           `json:"-" gorm:"column:geo_json;type:clob;not null" mapstructure:"-"`
+	Status                GeofenceStatus   `json:"status" gorm:"column:status;type:numeric;not null;default:1;index:idx_geofence_agency_client,priority:3;check:chk_geofence_status,status IN (1,2,3,4)" mapstructure:"status"`
+	ExcludeFromColocation bool             `json:"exclude_from_colocation" gorm:"column:exclude_from_colocation;type:numeric(1);not null;default:0" mapstructure:"exclude_from_colocation"`
+	Notes                 *string          `json:"notes,omitempty" gorm:"column:notes;type:varchar2;size:500" mapstructure:"notes"`
 
-	// ExcludeFromColocation and Notes back the "Known Locations" feature:
-	// circle geofences (parole offices, courthouses, etc.) that should be
-	// excluded from co-location detection to reduce false positives. Both
-	// are generic columns on the shared geofence table rather than a
-	// separate "known location" entity, since there is no distinct resource
-	// type today — any geofence can be flagged this way.
-	ExcludeFromColocation bool    `json:"exclude_from_colocation" gorm:"column:exclude_from_colocation;type:numeric(1);not null;default:0" mapstructure:"exclude_from_colocation"`
-	Notes                 *string `json:"notes,omitempty" gorm:"column:notes;type:varchar2;size:500" mapstructure:"notes"`
-
-	CreatedBy uuid.UUID  `json:"created_by" gorm:"column:created_by;type:uuid;<-:create;not null" mapstructure:"created_by"`
-	UpdatedBy *uuid.UUID `json:"updated_by,omitempty" gorm:"column:updated_by;type:uuid" mapstructure:"updated_by"`
+	// SynergyIdentifier is the owning agency's synergy identifier (see
+	// agencyClient.FetchAgencyDetails), denormalized here so ListGeofences
+	// can search/sort by it in memory without a live agency-service call
+	// per request (see internal/search, GeofenceController.ListGeofences).
+	// It's resolved externally (this service has no local agency table) and
+	// refreshed on any update that touches a search-affecting field (see
+	// UpdateGeofence's searchTextAffected); NULL until a row's first such
+	// write after this column existed.
+	SynergyIdentifier *string    `json:"-" gorm:"column:synergy_identifier;type:varchar2;size:100" mapstructure:"-"`
+	CreatedBy         uuid.UUID  `json:"created_by" gorm:"column:created_by;type:uuid;<-:create;not null" mapstructure:"created_by"`
+	UpdatedBy         *uuid.UUID `json:"updated_by,omitempty" gorm:"column:updated_by;type:uuid" mapstructure:"updated_by"`
 }
 
 func (t *Geofence) TableName() string {
