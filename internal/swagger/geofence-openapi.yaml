@@ -59,10 +59,58 @@ paths:
           $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalError'
-    get:
+  /agencies/{agency_id}/geofences:list:
+    parameters:
+      - $ref: '#/components/parameters/AgencyId'
+      - $ref: '#/components/parameters/CorrelationId'
+    post:
       summary: List geofences for an agency.
-      description: The composite (agency_id, client_id) index backs this query — it is the primary access pattern for the table.
+      operationId: listGeofences
+      x-http-method: LIST
+      x-actual-path: /agencies/{agency_id}/geofences
+      description: >
+        **Must be sent as `LIST /agencies/{agency_id}/geofences`, not
+        `POST /agencies/{agency_id}/geofences:list`** — the `:list` suffix
+        and `post` method are used here purely to give this operation a
+        distinct path from `POST /agencies/{agency_id}/geofences` (create a
+        geofence), since OpenAPI 3.0 cannot key two operations off the same
+        path with the same declared method (`x-http-method: LIST`). The
+        composite (agency_id, client_id) index backs this query — it is the
+        primary access pattern for the table. Also accepts an optional JSON
+        body (search/pagination/data envelope, mirroring sso-user-service's
+        list-users request) as an alternative to the query params below —
+        when the body has none of `search`/`pagination`/`data`, is empty, or
+        isn't JSON, every field falls back to its query param instead.
       tags: [Geofences]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeofenceListRequest'
+            examples:
+              searchByName:
+                summary: Search by name
+                value:
+                  search: { any: 'Downtown' }
+              searchByAddress:
+                summary: Search by address
+                value:
+                  search: { any: 'Main St' }
+              searchByHomeAgency:
+                summary: Search by owning agency's synergy identifier
+                value:
+                  search: { any: 'SYN123' }
+              searchByExcludedFromColocation:
+                summary: Only geofences excluded from co-location
+                value:
+                  search: { any: 'true' }
+              searchSortAndPaginate:
+                summary: Combine search, sort, and pagination
+                value:
+                  search: { any: 'springfield' }
+                  pagination: { limit: 25, page: 2 }
+                  data: { sort_by: home_agency, order: desc, include_subagency: true }
       parameters:
         - name: client_id
           in: query
@@ -70,6 +118,55 @@ paths:
             type: string
             format: uuid
           description: Filter to a specific client. Omit to return both agency-wide and client-specific fences.
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: |
+            Plain, case-insensitive substring search, applied in memory
+            after the DB fetch (agency/client/status filters are still
+            pushed to the query — only search/sort/pagination happen
+            application-side) rather than as a SQL/Oracle Text clause. No
+            prefix syntax or boolean operators — a match against *any* of
+            the fields below is enough.
+
+            | Field | Matches |
+            |---|---|
+            | name | The geofence's name. |
+            | address | The geo_json address object, flattened to text (street, city, state/province, postal code). |
+            | home_agency | The owning agency's synergy identifier (see sort_by's home_agency description) — not a human-readable agency name. |
+            | exclude_from_colocation | Matched as plain text against `"true"`/`"false"` — not a boolean filter. `q=true` matches every excluded geofence, `q=false` every included one. |
+
+            Coordinates and radius are not searchable — they're numeric,
+            not text, and rarely known/typed by a caller. A query shorter
+            than 3 characters is treated as invalid and matches nothing
+            (returns an empty page, not a 400) — the same minimum
+            sso-agency-service's agency search uses. Examples: `Downtown`,
+            `Main St`, `SYN123`, `true`.
+          examples:
+            name:
+              summary: Search by name
+              value: 'Downtown'
+            address:
+              summary: Search by address
+              value: 'Main St'
+            homeAgency:
+              summary: Search by owning agency's synergy identifier
+              value: 'SYN123'
+            excludedFromColocation:
+              summary: Only geofences excluded from co-location
+              value: 'true'
+        - name: agency_ids
+          in: query
+          schema:
+            type: string
+          description: Comma-separated agency UUIDs to include in the list query when includeSubagency=true.
+        - name: includeSubagency
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include subagency UUIDs from agency_ids in the list query.
         - name: status
           in: query
           schema:
@@ -87,6 +184,19 @@ paths:
             type: integer
             default: 25
             maximum: 200
+        - name: sort_by
+          in: query
+          schema:
+            type: string
+            enum: [name, exclude_from_colocation, home_agency, address]
+          description: Field to sort by, applied in memory after the DB fetch (see the q parameter above) — exactly the same fields search covers. home_agency sorts by the owning agency's synergy identifier. address sorts by the geofence's street address; geofences with no address sort last regardless of direction. Coordinates/radius aren't sortable (same reason they aren't searchable). Omit to keep the default (most recently created first).
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+          description: Sort direction for sort_by. Anything other than "desc" is treated as "asc".
       responses:
         '200':
           description: Paginated geofence list.
@@ -94,6 +204,39 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GeofenceListResponse'
+              examples:
+                nameOrAddressOrHomeAgencyMatch:
+                  summary: A Circle geofence matching a name/address/home_agency search
+                  value:
+                    data:
+                      - id: c1a1a7f0-1234-4a2b-9c3d-000000000001
+                        agency_id: 8396b27b-95ef-45cb-9b4c-1132812a33e1
+                        name: Downtown Office
+                        geo_json:
+                          type: Circle
+                          coordinates: [-84.388, 33.749]
+                          radius: 500
+                          address: { street1: 123 Main St, city: Atlanta }
+                        status: active
+                        user_id: d2b2b8f1-2345-4a2b-9c3d-000000000002
+                        exclude_from_colocation: false
+                        version: 1
+                    meta: { limit: 25, page: 1, pages: 1, total: 1 }
+                excludedMatch:
+                  summary: A Polygon geofence matching q=true (only geofences excluded from co-location)
+                  value:
+                    data:
+                      - id: c1a1a7f0-1234-4a2b-9c3d-000000000003
+                        agency_id: 8396b27b-95ef-45cb-9b4c-1132812a33e1
+                        name: Parole Office
+                        geo_json:
+                          type: Polygon
+                          coordinates: [[[-84.4, 33.75], [-84.39, 33.75], [-84.39, 33.76], [-84.4, 33.76], [-84.4, 33.75]]]
+                        status: active
+                        user_id: d2b2b8f1-2345-4a2b-9c3d-000000000002
+                        exclude_from_colocation: true
+                        version: 2
+                    meta: { limit: 25, page: 1, pages: 1, total: 1 }
         '400':
           $ref: '#/components/responses/BadRequest'
         '500':
@@ -567,6 +710,120 @@ components:
             version:
               type: integer
               description: Version number of the geofence record, incremented on each update.
+
+    GeofenceListRequest:
+      type: object
+      description: >
+        Optional LIST-body envelope, mirroring sso-user-service's
+        UserListRequest, for `LIST /agencies/{agency_id}/geofences`. Detected
+        by the presence of a top-level search, pagination, or data key; if
+        none of those three keys are present — including an empty or
+        non-JSON body — every field falls back to its query-string
+        equivalent instead, and the two are never merged for one request.
+      properties:
+        search:
+          type: object
+          description: Optional free-text search controls, equivalent to the q query param.
+          properties:
+            any:
+              type: string
+              description: |
+                Plain, case-insensitive substring search, equivalent to the
+                q query param — applied in memory after the DB fetch, not
+                as a SQL/Oracle Text clause. No prefix syntax or boolean
+                operators; a match against *any* of the fields below is
+                enough.
+
+                | Field | Matches |
+                |---|---|
+                | name | The geofence's name. |
+                | address | The geo_json address object, flattened to text (street, city, state/province, postal code). |
+                | home_agency | The owning agency's synergy identifier — not a human-readable agency name. |
+                | exclude_from_colocation | Matched as plain text against `"true"`/`"false"` — not a boolean filter. `true` matches every excluded geofence, `false` every included one. |
+
+                Coordinates and radius are not searchable. A value shorter
+                than 3 characters is invalid and matches nothing (an empty
+                page, not a 400). Example: `Downtown`.
+              example: 'Downtown'
+        pagination:
+          type: object
+          description: Optional paging controls.
+          properties:
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 200
+              default: 25
+              description: Page size, equivalent to the page_size query param.
+              example: 25
+            page:
+              type: integer
+              minimum: 1
+              default: 1
+              description: 1-based page number, equivalent to the page query param.
+              example: 1
+        data:
+          type: object
+          description: Geofence-list-specific filters and sort.
+          properties:
+            client_id:
+              type: string
+              format: uuid
+              deprecated: true
+              description: >
+                Not supported in the request body — this field is ignored.
+                Use the client_id query parameter to filter to a specific
+                client; it works regardless of whether search/pagination/data
+                are also supplied in the body.
+            agency_ids:
+              type: array
+              deprecated: true
+              items:
+                type: string
+                format: uuid
+              description: >
+                Not supported in the request body — this field is ignored.
+                Use the agency_ids query parameter for an explicit,
+                caller-resolved subagency scope. include_subagency below
+                still works from the body: with no agency_ids override, it
+                resolves the subagency hierarchy live via the agency
+                service, keyed off the agency_id path param.
+            status:
+              type: string
+              enum: [active, inactive, archived, deleted]
+              description: >
+                Equivalent to the status query param. Omit to return every
+                non-deleted geofence — deleted rows only surface when
+                explicitly requested.
+              example: active
+            sort_by:
+              type: string
+              enum: [name, exclude_from_colocation, home_agency, address]
+              description: >
+                Equivalent to the sort_by query param, applied in memory
+                after the DB fetch. home_agency sorts by the owning
+                agency's synergy identifier; address sorts by the
+                geofence's street address (geofences with no address sort
+                last, regardless of direction). Coordinates/radius aren't
+                sortable (same reason they aren't searchable). Omit to
+                keep the default order (most recently created first).
+              example: home_agency
+            order:
+              type: string
+              enum: [asc, desc]
+              default: asc
+              description: >
+                Sort direction for sort_by, equivalent to the order query
+                param. Anything other than "desc" is treated as "asc".
+              example: desc
+            include_subagency:
+              type: boolean
+              default: false
+              description: >
+                Equivalent to the includeSubagency query param: include
+                subagencies (resolved via the agency service, keyed off the
+                agency_id path param) in the list query.
+              example: true
 
     GeofenceListResponse:
       type: object
