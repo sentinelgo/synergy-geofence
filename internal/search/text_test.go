@@ -106,3 +106,65 @@ func TestMatchesQuery_NilGeofence(t *testing.T) {
 		t.Error("MatchesQuery(nil, ...) with an empty query = false, want true")
 	}
 }
+
+func TestMatchesFields(t *testing.T) {
+	g := &dbmodel.Geofence{
+		Name:                  "Parole Office",
+		GeoJSON:               `{"type":"Circle","coordinates":[-84.388,33.749],"radius":500,"address":{"street1":"123 Main St","city":"Atlanta"}}`,
+		ExcludeFromColocation: true,
+	}
+
+	for _, tc := range []struct {
+		name string
+		f    FieldFilters
+		want bool
+	}{
+		{name: "no filters matches everything", f: FieldFilters{}, want: true},
+		{name: "name substring, case-insensitive", f: FieldFilters{Name: "parole"}, want: true},
+		{name: "name mismatch", f: FieldFilters{Name: "downtown"}, want: false},
+		{name: "address substring", f: FieldFilters{Address: "main st"}, want: true},
+		{name: "address is not matched against name", f: FieldFilters{Address: "parole"}, want: false},
+		{name: "home agency exact, case-insensitive", f: FieldFilters{HomeAgencies: []string{"syn123"}}, want: true},
+		{name: "home agency is not a substring match", f: FieldFilters{HomeAgencies: []string{"SYN1"}}, want: false},
+		{name: "home agency list is OR", f: FieldFilters{HomeAgencies: []string{"SYN999", "SYN123"}}, want: true},
+		{name: "home agency list with no hit", f: FieldFilters{HomeAgencies: []string{"SYN998", "SYN999"}}, want: false},
+		{name: "excluded true matches", f: FieldFilters{ExcludeFromColocation: []bool{true}}, want: true},
+		{name: "excluded false does not match", f: FieldFilters{ExcludeFromColocation: []bool{false}}, want: false},
+		{name: "excluded true and false matches either", f: FieldFilters{ExcludeFromColocation: []bool{false, true}}, want: true},
+		{name: "all fields AND together", f: FieldFilters{Name: "parole", Address: "atlanta", HomeAgencies: []string{"SYN123"}, ExcludeFromColocation: []bool{true}}, want: true},
+		{name: "one failing field fails the AND", f: FieldFilters{Name: "parole", Address: "boston"}, want: false},
+		{name: "short value is honored (no MinQueryLen)", f: FieldFilters{Name: "P"}, want: true},
+		{name: "blank-only home agencies is no filter", f: FieldFilters{HomeAgencies: []string{" ", ""}}, want: true},
+		{name: "blank entries are ignored in a real list", f: FieldFilters{HomeAgencies: []string{" ", "SYN123"}}, want: true},
+		{name: "whitespace name is no filter", f: FieldFilters{Name: "   "}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MatchesFields(g, "SYN123", tc.f); got != tc.want {
+				t.Errorf("MatchesFields(%+v) = %v, want %v", tc.f, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchesFields_NilGeofence(t *testing.T) {
+	if MatchesFields(nil, "", FieldFilters{Name: "x"}) {
+		t.Error("MatchesFields(nil, filters) = true, want false")
+	}
+	if !MatchesFields(nil, "", FieldFilters{}) {
+		t.Error("MatchesFields(nil, no filters) = false, want true")
+	}
+}
+
+// TestMatchesFields_NoHomeAgency confirms a geofence with no home agency
+// (nil synergy_identifier, passed as "") never matches a home_agency
+// filter, including one that only contains blank entries alongside a
+// real value.
+func TestMatchesFields_NoHomeAgency(t *testing.T) {
+	g := &dbmodel.Geofence{Name: "Parole Office"}
+	if MatchesFields(g, "", FieldFilters{HomeAgencies: []string{"SYN1"}}) {
+		t.Error("geofence without home agency matched home_agency=SYN1")
+	}
+	if MatchesFields(g, "", FieldFilters{HomeAgencies: []string{"", "SYN1"}}) {
+		t.Error(`geofence without home agency matched home_agency=["", "SYN1"]`)
+	}
+}

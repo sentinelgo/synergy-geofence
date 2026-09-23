@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -11,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	dbmodel "github.com/sentinelgo/synergy-geofence/internal/database/model"
 	hmodel "github.com/sentinelgo/synergy-geofence/internal/handler/model"
+	"github.com/sentinelgo/synergy-geofence/internal/search"
 
 	localerrors "github.com/sentinelgo/synergy-geofence/internal/errors"
 )
@@ -25,6 +28,7 @@ const (
 	sortByField           listFilterField = "sort_by"
 	clientIdField         listFilterField = "client_id"
 	statusField           listFilterField = "status"
+	excludeFromColocField listFilterField = "exclude_from_colocation"
 	bodyField             listFilterField = "body"
 )
 
@@ -49,10 +53,12 @@ func listFilterFieldError(field listFilterField) *localerrors.CustomError {
 // geofenceListFilters is buildGeofenceListFilters' fully resolved result —
 // every ListGeofences input, regardless of whether it came from the JSON
 // body or query-string params. query is a plain search term (see
-// internal/search.MatchesQuery), applied in memory after the DB fetch —
-// not a SQL clause.
+// internal/search.MatchesQuery) and fields the per-field AND filters (see
+// internal/search.MatchesFields), both applied in memory after the DB
+// fetch — not SQL clauses.
 type geofenceListFilters struct {
 	query            string
+	fields           search.FieldFilters
 	includeSubagency bool
 	agencyIDs        []uuid.UUID
 	sortField        string
@@ -67,6 +73,79 @@ type geofenceListFilters struct {
 // sso-user-service's parse.SearchRequest.
 type SearchRequest struct {
 	Any string `json:"any,omitempty"`
+
+	// Per-field search filters, ANDed with each other and with Any —
+	// see search.FieldFilters. HomeAgency and ExcludeFromColocation take
+	// either a single value or an array (OR within the field).
+	Name                  string     `json:"name,omitempty"`
+	Address               string     `json:"address,omitempty"`
+	HomeAgency            stringList `json:"home_agency,omitempty"`
+	ExcludeFromColocation boolList   `json:"exclude_from_colocation,omitempty"`
+}
+
+// stringList is a JSON string-or-array-of-strings body field: "SYN1" and
+// ["SYN1", "SYN2"] both decode, so a single value doesn't need wrapping.
+// Blank entries are dropped, and a top-level null means "no filter".
+type stringList []string
+
+func (l *stringList) UnmarshalJSON(b []byte) error {
+	if isJSONNull(b) {
+		*l = nil
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*l = compactStrings([]string{one})
+		return nil
+	}
+	var many []*string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return fmt.Errorf("must be a string or an array of strings: %w", err)
+	}
+	out := make([]string, 0, len(many))
+	for _, v := range many {
+		if v == nil {
+			return errors.New("array entries must not be null")
+		}
+		out = append(out, *v)
+	}
+	*l = compactStrings(out)
+	return nil
+}
+
+// boolList is stringList's boolean counterpart: true and [true, false]
+// both decode. A top-level null means "no filter"; a null array entry is
+// an error rather than silently decoding as false (encoding/json's
+// default for null into a bool).
+type boolList []bool
+
+func (l *boolList) UnmarshalJSON(b []byte) error {
+	if isJSONNull(b) {
+		*l = nil
+		return nil
+	}
+	var one bool
+	if err := json.Unmarshal(b, &one); err == nil {
+		*l = boolList{one}
+		return nil
+	}
+	var many []*bool
+	if err := json.Unmarshal(b, &many); err != nil {
+		return fmt.Errorf("must be a boolean or an array of booleans: %w", err)
+	}
+	out := make(boolList, 0, len(many))
+	for _, v := range many {
+		if v == nil {
+			return errors.New("array entries must not be null")
+		}
+		out = append(out, *v)
+	}
+	*l = out
+	return nil
+}
+
+func isJSONNull(b []byte) bool {
+	return bytes.Equal(bytes.TrimSpace(b), []byte("null"))
 }
 
 // PaginationRequest is the list request body's "pagination" envelope key,
@@ -146,7 +225,7 @@ func buildGeofenceListFilters(c *gin.Context) (geofenceListFilters, listFilterFi
 		return geofenceListFilters{}, bodyField, err
 	}
 	if body != nil {
-		return geofenceListFiltersFromBody(*body)
+		return geofenceListFiltersFromBody(c, *body)
 	}
 	return geofenceListFiltersFromQuery(c)
 }
@@ -179,10 +258,21 @@ func geofenceListFiltersFromQuery(c *gin.Context) (geofenceListFilters, listFilt
 		return geofenceListFilters{}, statusField, err
 	}
 
+	excludeFromColocation, err := parseBoolListQuery(c, "exclude_from_colocation")
+	if err != nil {
+		return geofenceListFilters{}, excludeFromColocField, err
+	}
+
 	page, pageSize := parsePagination(c)
 
 	return geofenceListFilters{
-		query:            query,
+		query: query,
+		fields: search.FieldFilters{
+			Name:                  strings.TrimSpace(c.Query("name")),
+			Address:               strings.TrimSpace(c.Query("address")),
+			HomeAgencies:          parseListQuery(c, "home_agency"),
+			ExcludeFromColocation: excludeFromColocation,
+		},
 		includeSubagency: includeSubagency,
 		agencyIDs:        agencyIDs,
 		sortField:        sortField,
@@ -194,10 +284,21 @@ func geofenceListFiltersFromQuery(c *gin.Context) (geofenceListFilters, listFilt
 	}, "", nil
 }
 
-func geofenceListFiltersFromBody(body GeofenceListRequest) (geofenceListFilters, listFilterField, error) {
+// geofenceListFiltersFromBody reads every filter from the body, except
+// client_id and agency_ids: those have no body field, so they're still
+// read from the query string (the only query params honored when a body
+// is present).
+func geofenceListFiltersFromBody(c *gin.Context, body GeofenceListRequest) (geofenceListFilters, listFilterField, error) {
 	var query string
+	var fields search.FieldFilters
 	if body.Search != nil {
 		query = strings.TrimSpace(body.Search.Any)
+		fields = search.FieldFilters{
+			Name:                  strings.TrimSpace(body.Search.Name),
+			Address:               strings.TrimSpace(body.Search.Address),
+			HomeAgencies:          body.Search.HomeAgency,
+			ExcludeFromColocation: body.Search.ExcludeFromColocation,
+		}
 	}
 
 	data := body.Data
@@ -219,8 +320,21 @@ func geofenceListFiltersFromBody(body GeofenceListRequest) (geofenceListFilters,
 	}
 	page, pageSize := paginationFromValues(pagePtr, pageSizePtr)
 
+	agencyIDs, err := parseAgencyIdsQuery(c)
+	if err != nil {
+		return geofenceListFilters{}, agencyIdsField, err
+	}
+
+	clientID, err := parseOptionalUUIDQuery(c, "client_id")
+	if err != nil {
+		return geofenceListFilters{}, clientIdField, err
+	}
+
 	return geofenceListFilters{
 		query:            query,
+		fields:           fields,
+		agencyIDs:        agencyIDs,
+		clientID:         clientID,
 		includeSubagency: data.IncludeSubagency,
 		sortField:        sortField,
 		order:            normalizeOrderValue(data.Order),
@@ -243,6 +357,52 @@ func parseIncludeSubagencyQuery(c *gin.Context) (bool, error) {
 		return v, nil
 	}
 	return false, nil
+}
+
+// parseListQuery reads a multi-valued query param, accepting both
+// repeated (?k=a&k=b) and comma-separated (?k=a,b) forms, or a mix. Blank
+// entries are dropped; nil means the param is absent (no filter).
+func parseListQuery(c *gin.Context, key string) []string {
+	var out []string
+	for _, raw := range c.QueryArray(key) {
+		out = append(out, strings.Split(raw, ",")...)
+	}
+	return compactStrings(out)
+}
+
+// parseBoolListQuery is parseListQuery for booleans (e.g.
+// ?exclude_from_colocation=true,false). Only "true"/"false" (any case)
+// are accepted — not strconv.ParseBool's 1/0/t/f — matching the JSON
+// body, which only takes real booleans.
+func parseBoolListQuery(c *gin.Context, key string) ([]bool, error) {
+	raw := parseListQuery(c, key)
+	if raw == nil {
+		return nil, nil
+	}
+	out := make([]bool, 0, len(raw))
+	for _, r := range raw {
+		switch {
+		case strings.EqualFold(r, "true"):
+			out = append(out, true)
+		case strings.EqualFold(r, "false"):
+			out = append(out, false)
+		default:
+			return nil, fmt.Errorf("invalid %s: %q (want true or false)", key, r)
+		}
+	}
+	return out, nil
+}
+
+// compactStrings trims every entry and drops blank ones, returning nil
+// (not an empty slice) when nothing is left.
+func compactStrings(in []string) []string {
+	var out []string
+	for _, v := range in {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // parseSortByQuery validates the sort_by query param (if present) against

@@ -80,7 +80,16 @@ paths:
         body (search/pagination/data envelope, mirroring sso-user-service's
         list-users request) as an alternative to the query params below —
         when the body has none of `search`/`pagination`/`data`, is empty, or
-        isn't JSON, every field falls back to its query param instead.
+        isn't JSON, every field falls back to its query param instead. When
+        a body *is* used, every query param is ignored except `client_id`
+        and `agency_ids`, which have no body field and are always read from
+        the query string. A 400 is returned for an invalid `client_id` /
+        `agency_ids` / `status` / `sort_by` / `includeSubagency` /
+        `exclude_from_colocation` query value (`ERR_INVALID_QUERY` et al.,
+        naming the offending input), or for a malformed body — including a
+        wrong-typed or null-containing `search.home_agency` /
+        `search.exclude_from_colocation` (`ERR_BIND_PAYLOAD`, input
+        `geofence_req`).
       tags: [Geofences]
       requestBody:
         required: false
@@ -105,6 +114,10 @@ paths:
                 summary: Only geofences excluded from co-location
                 value:
                   search: { any: 'true' }
+              fieldFiltersAnded:
+                summary: Per-field filters (ANDed with each other and search.any)
+                value:
+                  search: { any: 'office', name: 'parole', address: 'atlanta', home_agency: ['SYN1', 'SYN2'], exclude_from_colocation: [true] }
               searchSortAndPaginate:
                 summary: Combine search, sort, and pagination
                 value:
@@ -156,6 +169,66 @@ paths:
             excludedFromColocation:
               summary: Only geofences excluded from co-location
               value: 'true'
+        - name: name
+          in: query
+          schema:
+            type: string
+          description: |
+            Per-field filter. Unlike q (which matches if *any* field
+            contains it), every per-field filter supplied — name, address,
+            home_agency, exclude_from_colocation — must match (AND), and
+            they AND with q as well. name/address are case-insensitive
+            substring matches against the same text q searches (address =
+            the flattened geo_json address); there is no 3-character
+            minimum for these. home_agency and exclude_from_colocation
+            accept several values (see their own descriptions). Omit a
+            param to not filter on that field. Example:
+            `?name=parole&address=atlanta&home_agency=SYN1,SYN2&exclude_from_colocation=true`.
+          example: 'Parole'
+        - name: address
+          in: query
+          schema:
+            type: string
+          description: >
+            Case-insensitive substring filter on the geofence's address —
+            the geo_json address object flattened to text (street, city,
+            state/province, postal code, country), the same text q
+            searches. ANDed with the other filters and q; no 3-character
+            minimum. Geofences with no address never match a non-blank
+            value.
+          example: 'Atlanta'
+        - name: home_agency
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+          description: >
+            One or more owning-agency synergy identifiers, either repeated
+            (`?home_agency=SYN1&home_agency=SYN2`) or comma-separated
+            (`?home_agency=SYN1,SYN2`). Matches a geofence whose home agency
+            equals *any* of them (OR within this field) — an exact,
+            case-insensitive match, not a substring, so SYN1 doesn't also
+            match SYN10. ANDed with the other filters and q.
+          example: ['SYN1', 'SYN2']
+        - name: exclude_from_colocation
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: boolean
+          description: >
+            One or more booleans, repeated or comma-separated, OR within
+            this field and ANDed with the other filters and q: `true`
+            returns only geofences excluded from co-location, `false` only
+            included ones, `true,false` both (same as omitting it). Only
+            `true`/`false` are accepted (case-insensitive) — any other entry,
+            including shorthands like `1`, `0`, `t` or `f`, is a 400.
+          example: [true]
         - name: agency_ids
           in: query
           schema:
@@ -719,11 +792,18 @@ components:
         by the presence of a top-level search, pagination, or data key; if
         none of those three keys are present — including an empty or
         non-JSON body — every field falls back to its query-string
-        equivalent instead, and the two are never merged for one request.
+        equivalent instead. When the body is used, every query param is
+        ignored except client_id and agency_ids (no body field; always read
+        from the query string).
       properties:
         search:
           type: object
-          description: Optional free-text search controls, equivalent to the q query param.
+          description: >
+            Optional search controls: any is the free-text search (equivalent
+            to the q query param, matches if any field contains it); name,
+            address, home_agency and exclude_from_colocation are per-field
+            filters (equivalent to the same-named query params) that must
+            all match (AND), together with any.
           properties:
             any:
               type: string
@@ -745,6 +825,46 @@ components:
                 than 3 characters is invalid and matches nothing (an empty
                 page, not a 400). Example: `Downtown`.
               example: 'Downtown'
+            name:
+              type: string
+              description: >
+                Equivalent to the name query param — case-insensitive
+                substring filter on the name, ANDed with the other search
+                fields and any.
+              example: 'Parole'
+            address:
+              type: string
+              description: >
+                Equivalent to the address query param — case-insensitive
+                substring filter on the flattened geo_json address, ANDed
+                with the other search fields and any.
+              example: 'Atlanta'
+            home_agency:
+              oneOf:
+                - type: string
+                - type: array
+                  items:
+                    type: string
+              description: >
+                Equivalent to the home_agency query param — a single owning
+                agency synergy identifier or an array of them. Matches a
+                geofence whose home agency equals *any* value (OR within
+                this field; exact, case-insensitive, not a substring), ANDed
+                with the other search fields and any.
+              example: ['SYN1', 'SYN2']
+            exclude_from_colocation:
+              oneOf:
+                - type: boolean
+                - type: array
+                  items:
+                    type: boolean
+              description: >
+                Equivalent to the exclude_from_colocation query param — a
+                single boolean or an array (OR within this field, so
+                [true, false] matches both), ANDed with the other search
+                fields and any. Omit it, or send null or [], to return both.
+                A null array entry is a 400.
+              example: [true, false]
         pagination:
           type: object
           description: Optional paging controls.
@@ -784,7 +904,8 @@ components:
               description: >
                 Not supported in the request body — this field is ignored.
                 Use the agency_ids query parameter for an explicit,
-                caller-resolved subagency scope. include_subagency below
+                caller-resolved subagency scope; like client_id, it's still
+                honored alongside a body. include_subagency below
                 still works from the body: with no agency_ids override, it
                 resolves the subagency hierarchy live via the agency
                 service, keyed off the agency_id path param.

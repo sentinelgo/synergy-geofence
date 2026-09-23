@@ -217,7 +217,8 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 	}
 
 	// FindByAgencyAndClient only applies structural filters (agency/client/
-	// status) — search, sort, and pagination all happen here in memory over
+	// status) — search (the free-text q plus the per-field AND filters),
+	// sort, and pagination all happen here in memory over
 	// the full result set, the same fetch-broadly-then-filter/sort/
 	// paginate-in-Go pattern sso-agency-service's search already uses,
 	// rather than an Oracle Text index or SQL ORDER BY/LIMIT.
@@ -234,7 +235,8 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 		if entity.SynergyIdentifier != nil {
 			homeAgency = *entity.SynergyIdentifier
 		}
-		if search.MatchesQuery(entity, homeAgency, filters.query) {
+		if search.MatchesQuery(entity, homeAgency, filters.query) &&
+			search.MatchesFields(entity, homeAgency, filters.fields) {
 			matched = append(matched, entity)
 		}
 	}
