@@ -11,12 +11,12 @@ import (
 
 // geofenceSortFields whitelists the ListGeofences sort_by values — exactly
 // the fields search.MatchesQuery also matches on (name, address,
-// home_agency, exclude_from_colocation). coordinates/radius aren't
-// supported here, same as search.
+// exclude_from_colocation). coordinates/radius aren't supported here, same
+// as search. home_agency isn't sortable: it's an agency UUID, and there's
+// no stored agency name/identifier to sort by meaningfully.
 var geofenceSortFields = map[string]bool{
 	"name":                    true,
 	"exclude_from_colocation": true,
-	"home_agency":             true,
 	"address":                 true,
 }
 
@@ -51,8 +51,6 @@ func lessGeofence(a, b *dbmodel.Geofence, sortField string, desc bool) bool {
 		return lessWithTiebreak(strings.ToLower(a.Name), strings.ToLower(b.Name), a.ID, b.ID, desc)
 	case "exclude_from_colocation":
 		return lessBoolWithTiebreak(a.ExcludeFromColocation, b.ExcludeFromColocation, a.ID, b.ID, desc)
-	case "home_agency":
-		return lessNullableWithTiebreak(a.SynergyIdentifier, b.SynergyIdentifier, a.ID, b.ID, desc)
 	case "address":
 		aAddr, bAddr := nilIfEmpty(search.AddressText(a.GeoJSON)), nilIfEmpty(search.AddressText(b.GeoJSON))
 		return lessNullableWithTiebreak(aAddr, bAddr, a.ID, b.ID, desc)

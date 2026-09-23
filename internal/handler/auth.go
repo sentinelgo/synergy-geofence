@@ -326,6 +326,13 @@ func abortUnauthorized(c *gin.Context) {
 }
 
 func abortForbidden(c *gin.Context, sc *auth.Jwt, agencyID uuid.UUID) {
-	log.LoggerFromContext(c).With(pkg.AgencyIDKey(), agencyID, "subject", sc.Subject()).Warn("caller lacks the required admin role at the requested agency")
+	// sc is nil when no claims were set at all (e.g. JWT verification
+	// disabled, where the role gates are skipped but ListGeofences'
+	// includeSubagency path still reaches here).
+	var subject string
+	if sc != nil {
+		subject = sc.Subject()
+	}
+	log.LoggerFromContext(c).With(pkg.AgencyIDKey(), agencyID, "subject", subject).Warn("caller lacks the required admin role at the requested agency")
 	c.AbortWithStatusJSON(http.StatusForbidden, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrAuth, localerrors.AgencyId)})
 }

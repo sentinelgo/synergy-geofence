@@ -24,11 +24,11 @@ type listFilterField string
 
 const (
 	includeSubagencyField listFilterField = "includeSubagency"
-	agencyIdsField        listFilterField = "agency_ids"
 	sortByField           listFilterField = "sort_by"
 	clientIdField         listFilterField = "client_id"
 	statusField           listFilterField = "status"
 	excludeFromColocField listFilterField = "exclude_from_colocation"
+	homeAgencyField       listFilterField = "home_agency"
 	bodyField             listFilterField = "body"
 )
 
@@ -60,7 +60,6 @@ type geofenceListFilters struct {
 	query            string
 	fields           search.FieldFilters
 	includeSubagency bool
-	agencyIDs        []uuid.UUID
 	sortField        string
 	order            string
 	clientID         *uuid.UUID
@@ -75,16 +74,18 @@ type SearchRequest struct {
 	Any string `json:"any,omitempty"`
 
 	// Per-field search filters, ANDed with each other and with Any —
-	// see search.FieldFilters. HomeAgency and ExcludeFromColocation take
-	// either a single value or an array (OR within the field).
+	// see search.FieldFilters. HomeAgency (owning agency UUIDs) and
+	// ExcludeFromColocation take either a single value or an array (OR
+	// within the field).
 	Name                  string     `json:"name,omitempty"`
 	Address               string     `json:"address,omitempty"`
 	HomeAgency            stringList `json:"home_agency,omitempty"`
 	ExcludeFromColocation boolList   `json:"exclude_from_colocation,omitempty"`
 }
 
-// stringList is a JSON string-or-array-of-strings body field: "SYN1" and
-// ["SYN1", "SYN2"] both decode, so a single value doesn't need wrapping.
+// stringList is a JSON string-or-array-of-strings body field: "<uuid>" and
+// ["<uuid1>", "<uuid2>"] both decode, so a single value doesn't need
+// wrapping.
 // Blank entries are dropped, and a top-level null means "no filter".
 type stringList []string
 
@@ -161,8 +162,6 @@ type PaginationRequest struct {
 // geofence-list-specific filters and sort, mirroring sso-user-service's
 // UserListData.
 type GeofenceListData struct {
-	// agency_ids (the explicit pre-resolved subagency scope) isn't
-	// supported in the body yet — only via its existing query param.
 	Status           string `json:"status,omitempty"`
 	SortBy           string `json:"sort_by,omitempty"`
 	Order            string `json:"order,omitempty"`
@@ -238,11 +237,6 @@ func geofenceListFiltersFromQuery(c *gin.Context) (geofenceListFilters, listFilt
 		return geofenceListFilters{}, includeSubagencyField, err
 	}
 
-	agencyIDs, err := parseAgencyIdsQuery(c)
-	if err != nil {
-		return geofenceListFilters{}, agencyIdsField, err
-	}
-
 	sortField, err := parseSortByQuery(c)
 	if err != nil {
 		return geofenceListFilters{}, sortByField, err
@@ -263,6 +257,11 @@ func geofenceListFiltersFromQuery(c *gin.Context) (geofenceListFilters, listFilt
 		return geofenceListFilters{}, excludeFromColocField, err
 	}
 
+	homeAgencyIDs, err := parseAgencyIDStrings(parseListQuery(c, "home_agency"))
+	if err != nil {
+		return geofenceListFilters{}, homeAgencyField, err
+	}
+
 	page, pageSize := parsePagination(c)
 
 	return geofenceListFilters{
@@ -270,11 +269,10 @@ func geofenceListFiltersFromQuery(c *gin.Context) (geofenceListFilters, listFilt
 		fields: search.FieldFilters{
 			Name:                  strings.TrimSpace(c.Query("name")),
 			Address:               strings.TrimSpace(c.Query("address")),
-			HomeAgencies:          parseListQuery(c, "home_agency"),
+			HomeAgencyIDs:         homeAgencyIDs,
 			ExcludeFromColocation: excludeFromColocation,
 		},
 		includeSubagency: includeSubagency,
-		agencyIDs:        agencyIDs,
 		sortField:        sortField,
 		order:            parseOrderQuery(c),
 		clientID:         clientID,
@@ -285,18 +283,21 @@ func geofenceListFiltersFromQuery(c *gin.Context) (geofenceListFilters, listFilt
 }
 
 // geofenceListFiltersFromBody reads every filter from the body, except
-// client_id and agency_ids: those have no body field, so they're still
-// read from the query string (the only query params honored when a body
-// is present).
+// client_id: it has no body field, so it's still read from the query
+// string (the only query param honored when a body is present).
 func geofenceListFiltersFromBody(c *gin.Context, body GeofenceListRequest) (geofenceListFilters, listFilterField, error) {
 	var query string
 	var fields search.FieldFilters
 	if body.Search != nil {
+		homeAgencyIDs, err := parseAgencyIDStrings(body.Search.HomeAgency)
+		if err != nil {
+			return geofenceListFilters{}, homeAgencyField, err
+		}
 		query = strings.TrimSpace(body.Search.Any)
 		fields = search.FieldFilters{
 			Name:                  strings.TrimSpace(body.Search.Name),
 			Address:               strings.TrimSpace(body.Search.Address),
-			HomeAgencies:          body.Search.HomeAgency,
+			HomeAgencyIDs:         homeAgencyIDs,
 			ExcludeFromColocation: body.Search.ExcludeFromColocation,
 		}
 	}
@@ -320,11 +321,6 @@ func geofenceListFiltersFromBody(c *gin.Context, body GeofenceListRequest) (geof
 	}
 	page, pageSize := paginationFromValues(pagePtr, pageSizePtr)
 
-	agencyIDs, err := parseAgencyIdsQuery(c)
-	if err != nil {
-		return geofenceListFilters{}, agencyIdsField, err
-	}
-
 	clientID, err := parseOptionalUUIDQuery(c, "client_id")
 	if err != nil {
 		return geofenceListFilters{}, clientIdField, err
@@ -333,7 +329,6 @@ func geofenceListFiltersFromBody(c *gin.Context, body GeofenceListRequest) (geof
 	return geofenceListFilters{
 		query:            query,
 		fields:           fields,
-		agencyIDs:        agencyIDs,
 		clientID:         clientID,
 		includeSubagency: data.IncludeSubagency,
 		sortField:        sortField,
@@ -441,21 +436,9 @@ func normalizeOrderValue(order string) string {
 	return "asc"
 }
 
-// parseAgencyIdsQuery parses the comma-separated agency_ids query param
-// (an explicit subagency scope the caller already resolved) into UUIDs. It
-// returns a nil slice when the param is absent so callers can distinguish
-// "no explicit scope given" from "explicit but empty".
-func parseAgencyIdsQuery(c *gin.Context) ([]uuid.UUID, error) {
-	raw := strings.TrimSpace(c.Query("agency_ids"))
-	if raw == "" {
-		return nil, nil
-	}
-	return parseAgencyIDStrings(strings.Split(raw, ","))
-}
-
-// parseAgencyIDStrings is parseAgencyIdsQuery's source-agnostic core: the
-// query path splits its comma-joined string into a slice first, the body
-// path already has one natively (agency_ids is a JSON array there).
+// parseAgencyIDStrings parses the home_agency filter's agency UUID strings,
+// from either the query string or the body. Blank entries are skipped; nil
+// means none.
 func parseAgencyIDStrings(raw []string) ([]uuid.UUID, error) {
 	agencyIDs := make([]uuid.UUID, 0, len(raw))
 	for _, p := range raw {

@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dgraph-io/ristretto"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	pkg "github.com/sentinelgo/synergy-geofence/internal"
@@ -30,6 +29,7 @@ import (
 	"github.com/sentinelgo/synergy-common/pkg/log"
 	"github.com/sentinelgo/synergy-common/pkg/otelx"
 	gincommon "github.com/sentinelgo/synergy-common/pkg/otelx/gin"
+	"github.com/spf13/viper"
 )
 
 const (
@@ -44,23 +44,21 @@ type GeofenceController struct {
 	publisher   events.Publisher
 	activityLog activitylogger.Logger
 	// m2mAcli is a client_credentials-authenticated *http.Client (see
-	// config.ClientCredentialsConfig.Client) used for every agency-service
-	// m2m call (FetchHierarchy, FetchAgencyDetails) — nil if
+	// config.ClientCredentialsConfig.Client) used for the agency-service
+	// m2m hierarchy call (FetchHierarchy) — nil if
 	// common.agency.client-credentials isn't configured, in which case
-	// those calls fail gracefully (see resolveListAgencyIDs/resolveHomeAgency)
-	// rather than the service failing to start.
-	m2mAcli         *http.Client
-	homeAgencyCache *ristretto.Cache
+	// that call fails gracefully (see resolveListAgencyIDs) rather than the
+	// service failing to start.
+	m2mAcli *http.Client
 }
 
 func NewGeofenceController(datasource database.GeofenceDbAdapter, cfg *config.Config, publisher events.Publisher, activityLog activitylogger.Logger, m2mAcli *http.Client) *GeofenceController {
 	return &GeofenceController{
-		datasource:      datasource,
-		cfg:             cfg,
-		publisher:       publisher,
-		activityLog:     activityLog,
-		m2mAcli:         m2mAcli,
-		homeAgencyCache: newHomeAgencyCache(),
+		datasource:  datasource,
+		cfg:         cfg,
+		publisher:   publisher,
+		activityLog: activityLog,
+		m2mAcli:     m2mAcli,
 	}
 }
 
@@ -101,7 +99,7 @@ func (x *GeofenceController) CreateGeofence(c *gin.Context) {
 		return
 	}
 
-	if err = x.datasource.CreateGeofence(c, entity, x.resolveHomeAgency(c, agencyID)); err != nil {
+	if err = x.datasource.CreateGeofence(c, entity); err != nil {
 		if errors.Is(err, cmodel.ErrDuplicateRecord) {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrDuplicate, localerrors.Name)})
 			return
@@ -203,17 +201,23 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 		return
 	}
 
-	// An explicit agency_ids list means the caller already resolved the
-	// subagency scope (e.g. from a prior hierarchy lookup) — use it as-is
-	// rather than re-resolving via resolveListAgencyIDs.
-	agencyIDs := filters.agencyIDs
-	if agencyIDs == nil {
-		agencyIDs, err = x.resolveListAgencyIDs(c, agencyID, filters.includeSubagency)
-		if err != nil {
-			l.With("error", err).Error("failed to resolve list agency scope")
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrAuth, localerrors.AgencyId)})
-			return
-		}
+	// The agency scope is always resolved server-side — the path agency,
+	// plus (with includeSubagency) the subagencies the caller may see —
+	// never taken from the request. home_agency can only narrow it further.
+	agencyIDs, err := x.resolveListAgencyIDs(c, agencyID, filters.includeSubagency)
+	if err != nil {
+		// Only the agency-service hierarchy lookup can fail here (auth
+		// failures abort inside resolveListAgencyIDs instead), so this is an
+		// upstream outage — report it as one, not as a 403.
+		l.With("error", err).Error("failed to resolve list agency scope")
+		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrAgencyService, localerrors.AgencyId)})
+		return
+	}
+	// resolveListAgencyIDs may itself have already written a 403 (no
+	// service claims) and returned nil, nil — stop here rather than
+	// querying and appending the list to that response.
+	if c.IsAborted() {
+		return
 	}
 
 	// FindByAgencyAndClient only applies structural filters (agency/client/
@@ -231,12 +235,8 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 
 	matched := make([]*dbmodel.Geofence, 0, len(entities))
 	for _, entity := range entities {
-		var homeAgency string
-		if entity.SynergyIdentifier != nil {
-			homeAgency = *entity.SynergyIdentifier
-		}
-		if search.MatchesQuery(entity, homeAgency, filters.query) &&
-			search.MatchesFields(entity, homeAgency, filters.fields) {
+		if search.MatchesQuery(entity, filters.query) &&
+			search.MatchesFields(entity, filters.fields) {
 			matched = append(matched, entity)
 		}
 	}
@@ -284,6 +284,16 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 	})
 }
 
+// resolveListAgencyIDs returns the agency scope ListGeofences queries: the
+// path agency first, then (with includeSubagency) every subagency from the
+// agency service's hierarchy that the caller may see — all of them for
+// sentinel System/Global/Read-Only Administrators, otherwise only agencies
+// the caller is associated with. With JWT verification disabled (the same
+// dev-only bypass requireAgencyViewer honors) there are no claims to check,
+// so the whole hierarchy is included. Without service claims otherwise, it
+// writes a 403 itself and returns nil, nil (callers must check
+// c.IsAborted()); a non-nil error always means the agency-service call
+// failed.
 func (x *GeofenceController) resolveListAgencyIDs(
 	c *gin.Context,
 	agencyID uuid.UUID,
@@ -295,13 +305,14 @@ func (x *GeofenceController) resolveListAgencyIDs(
 
 	claims := pkg.Claims(c)
 	svc := serviceClaims(claims)
+	verificationDisabled := viper.GetBool("common.jwt.verification.disabled")
 
-	if svc == nil {
+	if svc == nil && !verificationDisabled {
 		abortForbidden(c, claims, pkg.AgencyID(c))
 		return nil, nil
 	}
 
-	client, err := newAgencyClient(x.cfg, x.m2mAcli, x.homeAgencyCache)
+	client, err := newAgencyClient(x.cfg, x.m2mAcli)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +322,8 @@ func (x *GeofenceController) resolveListAgencyIDs(
 		return nil, err
 	}
 
-	isAdmin := svc.IsSystemAdmin() ||
+	seeAll := svc == nil || // only reachable with verification disabled
+		svc.IsSystemAdmin() ||
 		svc.IsGlobalAdmin() ||
 		svc.IsReadOnlyAdmin()
 
@@ -319,10 +331,12 @@ func (x *GeofenceController) resolveListAgencyIDs(
 	agencyIDs = append(agencyIDs, agencyID)
 
 	agencyIDs = append(agencyIDs, UniqueBy(rawIDs, func(id uuid.UUID) (uuid.UUID, bool) {
-		if id == uuid.Nil {
+		// The hierarchy includes the path agency itself (its root) — it's
+		// already first in agencyIDs.
+		if id == uuid.Nil || id == agencyID {
 			return uuid.Nil, false
 		}
-		if isAdmin {
+		if seeAll {
 			return id, true
 		}
 
@@ -330,28 +344,6 @@ func (x *GeofenceController) resolveListAgencyIDs(
 	})...,
 	)
 	return agencyIDs, nil
-}
-
-// resolveHomeAgency best-effort looks up the owning agency's
-// synergy_identifier for search/sort under ListGeofences' "home_agency"
-// field (see search.MatchesQuery and list_sort.go). A lookup failure never
-// fails the create/update request — same as Pulsar publish being
-// best-effort elsewhere in this handler — it only means that one
-// geofence's home_agency won't reflect it until the next update that
-// resolves successfully.
-func (x *GeofenceController) resolveHomeAgency(c *gin.Context, agencyID uuid.UUID) string {
-	l := log.LoggerFromContext(c)
-	client, err := newAgencyClient(x.cfg, x.m2mAcli, x.homeAgencyCache)
-	if err != nil {
-		l.With("error", err).Warn("could not build agency client, home agency will not be indexed")
-		return ""
-	}
-	homeAgency, err := client.FetchAgencyDetails(c, agencyID)
-	if err != nil {
-		l.With("error", err).Warn("could not resolve home agency, home agency will not be indexed")
-		return ""
-	}
-	return homeAgency
 }
 
 func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
@@ -403,7 +395,7 @@ func (x *GeofenceController) UpdateGeofence(c *gin.Context) {
 	// the optimistic-concurrency check could never fail.
 	entity.Version = req.Version
 
-	if err = x.datasource.UpdateGeofence(c, entity, x.resolveHomeAgency(c, agencyID), selectFields...); err != nil {
+	if err = x.datasource.UpdateGeofence(c, entity, selectFields...); err != nil {
 		if errors.Is(err, cmodel.ErrOptimisticLock) {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrOptimisticLock, localerrors.Geofence)})
 			return

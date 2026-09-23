@@ -24,8 +24,8 @@ common:
   activity-log:
     disabled: false
     address: ${ACTIVITY_LOG_ADDRESS}
-  # Used for every agency-service m2m call (subagency hierarchy lookup,
-  # home-agency profile — see internal/handler/agency_client.go). The
+  # Used for the agency-service m2m subagency hierarchy lookup (see
+  # internal/handler/agency_client.go). The
   # client-credentials client is a confidential Hydra client, one per
   # environment, using client_secret_basic (auth-style: in-header) with
   # agency.read as its only allowed scope.

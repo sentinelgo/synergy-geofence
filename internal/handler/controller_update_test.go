@@ -32,8 +32,8 @@ type fakeGeofenceDbAdapter struct {
 
 	findByID              func(ctx context.Context, agencyID, id uuid.UUID) (*dbmodel.Geofence, error)
 	findByAgencyAndClient func(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *dbmodel.GeofenceStatus, agencyIDs []uuid.UUID) ([]*dbmodel.Geofence, error)
-	update                func(ctx context.Context, g *dbmodel.Geofence, homeAgency string, selectFields ...any) error
-	create                func(ctx context.Context, g *dbmodel.Geofence, homeAgency string) error
+	update                func(ctx context.Context, g *dbmodel.Geofence, selectFields ...any) error
+	create                func(ctx context.Context, g *dbmodel.Geofence) error
 	delete_               func(ctx context.Context, agencyID, id, userID uuid.UUID) error
 }
 
@@ -41,12 +41,12 @@ func (f *fakeGeofenceDbAdapter) FindByID(ctx context.Context, agencyID, id uuid.
 	return f.findByID(ctx, agencyID, id)
 }
 
-func (f *fakeGeofenceDbAdapter) UpdateGeofence(ctx context.Context, g *dbmodel.Geofence, homeAgency string, selectFields ...any) error {
-	return f.update(ctx, g, homeAgency, selectFields...)
+func (f *fakeGeofenceDbAdapter) UpdateGeofence(ctx context.Context, g *dbmodel.Geofence, selectFields ...any) error {
+	return f.update(ctx, g, selectFields...)
 }
 
-func (f *fakeGeofenceDbAdapter) CreateGeofence(ctx context.Context, g *dbmodel.Geofence, homeAgency string) error {
-	return f.create(ctx, g, homeAgency)
+func (f *fakeGeofenceDbAdapter) CreateGeofence(ctx context.Context, g *dbmodel.Geofence) error {
+	return f.create(ctx, g)
 }
 
 func (f *fakeGeofenceDbAdapter) DeleteGeofence(ctx context.Context, agencyID, id, userID uuid.UUID) error {
@@ -130,7 +130,7 @@ func TestUpdateGeofence_RadiusChangeOnly_AuditsRadiusField(t *testing.T) {
 			cp := *existing
 			return &cp, nil
 		},
-		update: func(_ context.Context, g *dbmodel.Geofence, _ string, _ ...any) error {
+		update: func(_ context.Context, g *dbmodel.Geofence, _ ...any) error {
 			return nil
 		},
 	}
@@ -190,7 +190,7 @@ func TestUpdateGeofence_ExcludeFromColocationOnly_AuditsExcludedCategory(t *test
 			cp := *existing
 			return &cp, nil
 		},
-		update: func(context.Context, *dbmodel.Geofence, string, ...any) error { return nil },
+		update: func(context.Context, *dbmodel.Geofence, ...any) error { return nil },
 	}
 	activityLog := &fakeActivityLogger{}
 	ctrl := newTestController(datasource, activityLog)
@@ -227,7 +227,7 @@ func TestCreateGeofence_AuditsAddedCategory(t *testing.T) {
 	agencyID := uuid.New()
 
 	datasource := &fakeGeofenceDbAdapter{
-		create: func(_ context.Context, g *dbmodel.Geofence, _ string) error { return nil },
+		create: func(_ context.Context, g *dbmodel.Geofence) error { return nil },
 	}
 	activityLog := &fakeActivityLogger{}
 	ctrl := newTestController(datasource, activityLog)
@@ -329,7 +329,6 @@ func namedGeofence(agencyID uuid.UUID, name string) *dbmodel.Geofence {
 func TestListGeofences_FiltersByAgencyClientScopeAndSearch(t *testing.T) {
 	agencyID := uuid.New()
 	clientID := uuid.New()
-	agencyFilter := []uuid.UUID{uuid.New(), uuid.New()}
 
 	match := namedGeofence(agencyID, "Downtown Office")
 	noMatch := namedGeofence(agencyID, "Uptown Depot")
@@ -345,13 +344,8 @@ func TestListGeofences_FiltersByAgencyClientScopeAndSearch(t *testing.T) {
 			if gotStatus != nil {
 				t.Fatalf("status = %v, want nil", gotStatus)
 			}
-			if len(gotAgencyIDs) != len(agencyFilter) {
-				t.Fatalf("agencyIDs = %v, want %v", gotAgencyIDs, agencyFilter)
-			}
-			for i := range agencyFilter {
-				if gotAgencyIDs[i] != agencyFilter[i] {
-					t.Fatalf("agencyIDs[%d] = %v, want %v", i, gotAgencyIDs[i], agencyFilter[i])
-				}
+			if len(gotAgencyIDs) != 1 || gotAgencyIDs[0] != agencyID {
+				t.Fatalf("agencyIDs = %v, want [%v]", gotAgencyIDs, agencyID)
 			}
 			return []*dbmodel.Geofence{match, noMatch}, nil
 		},
@@ -359,7 +353,7 @@ func TestListGeofences_FiltersByAgencyClientScopeAndSearch(t *testing.T) {
 	ctrl := newTestController(datasource, &fakeActivityLogger{})
 
 	c, w := newTestGinContext(t, http.MethodGet,
-		"/agencies/"+agencyID.String()+"/geofences?q=Downtown&client_id="+clientID.String()+"&includeSubagency=true&agency_ids="+agencyFilter[0].String()+","+agencyFilter[1].String(),
+		"/agencies/"+agencyID.String()+"/geofences?q=Downtown&client_id="+clientID.String(),
 		"",
 		nil, agencyID)
 
@@ -435,40 +429,82 @@ func TestListGeofences_SearchMatchesExcludeFromColocation(t *testing.T) {
 	}
 }
 
-func TestListGeofences_RejectsInvalidAgencyIDs(t *testing.T) {
+// TestListGeofences_IgnoresAgencyIDsParam guards the removed agency_ids
+// param: it used to replace the agency scope as-is, letting a viewer of
+// one agency list another's geofences. The scope must now always be the
+// server-resolved one (here, just the path agency), whatever the request
+// sends — via the query string or alongside a body.
+func TestListGeofences_IgnoresAgencyIDsParam(t *testing.T) {
 	agencyID := uuid.New()
-	called := false
+	otherAgencyID := uuid.New()
+
 	datasource := &fakeGeofenceDbAdapter{
-		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
-			called = true
+		findByAgencyAndClient: func(_ context.Context, _ uuid.UUID, _ *uuid.UUID, _ *dbmodel.GeofenceStatus, gotAgencyIDs []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			if len(gotAgencyIDs) != 1 || gotAgencyIDs[0] != agencyID {
+				t.Fatalf("agencyIDs = %v, want only the path agency [%v]", gotAgencyIDs, agencyID)
+			}
 			return nil, nil
 		},
 	}
 	ctrl := newTestController(datasource, &fakeActivityLogger{})
 
-	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences?includeSubagency=true&agency_ids=not-a-uuid", "", nil, agencyID)
+	for _, tc := range []struct{ name, target, body string }{
+		{name: "query", target: "/agencies/" + agencyID.String() + "/geofences?agency_ids=" + otherAgencyID.String()},
+		{name: "query, malformed value", target: "/agencies/" + agencyID.String() + "/geofences?agency_ids=not-a-uuid"},
+		{name: "alongside a body", target: "/agencies/" + agencyID.String() + "/geofences?agency_ids=" + otherAgencyID.String(), body: `{"search":{"name":"x"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, w := newTestGinContext(t, http.MethodGet, tc.target, tc.body, nil, agencyID)
 
-	ctrl.ListGeofences(c)
+			ctrl.ListGeofences(c)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
-	}
-	if called {
-		t.Fatal("datasource should not be called for invalid agency_ids")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }
 
-// TestListGeofences_SortsByHomeAgency confirms sort_by/order are applied in
+// TestListGeofences_SubagencyWithoutServiceClaimsIsForbiddenOnly confirms
+// that when resolveListAgencyIDs itself aborts with 403 (includeSubagency
+// but no service claims), ListGeofences stops there — no query, and no
+// geofence list appended to the 403 body.
+func TestListGeofences_SubagencyWithoutServiceClaimsIsForbiddenOnly(t *testing.T) {
+	agencyID := uuid.New()
+	called := false
+	datasource := &fakeGeofenceDbAdapter{
+		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
+			called = true
+			return []*dbmodel.Geofence{namedGeofence(agencyID, "Leaked")}, nil
+		},
+	}
+	ctrl := newTestController(datasource, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences?includeSubagency=true", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body = %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatal("datasource should not be called after a 403")
+	}
+	if strings.Contains(w.Body.String(), "Leaked") || strings.Contains(w.Body.String(), `"data"`) {
+		t.Fatalf("403 body = %s, want only the error", w.Body.String())
+	}
+}
+
+// TestListGeofences_SortsByAddress confirms sort_by/order are applied in
 // memory, over the DB layer's unsorted result set, rather than being passed
 // through to it.
-func TestListGeofences_SortsByHomeAgency(t *testing.T) {
+func TestListGeofences_SortsByAddress(t *testing.T) {
 	agencyID := uuid.New()
-	idA, idZ := "AAA", "ZZZ"
 
 	gA := namedGeofence(agencyID, "A")
-	gA.SynergyIdentifier = &idA
+	gA.GeoJSON = `{"type":"Circle","coordinates":[-84.388,33.749],"radius":500,"address":{"street1":"1 Alpha St"}}`
 	gZ := namedGeofence(agencyID, "Z")
-	gZ.SynergyIdentifier = &idZ
+	gZ.GeoJSON = `{"type":"Circle","coordinates":[-84.388,33.749],"radius":500,"address":{"street1":"9 Zulu St"}}`
 
 	datasource := &fakeGeofenceDbAdapter{
 		findByAgencyAndClient: func(context.Context, uuid.UUID, *uuid.UUID, *dbmodel.GeofenceStatus, []uuid.UUID) ([]*dbmodel.Geofence, error) {
@@ -478,7 +514,7 @@ func TestListGeofences_SortsByHomeAgency(t *testing.T) {
 	ctrl := newTestController(datasource, &fakeActivityLogger{})
 
 	c, w := newTestGinContext(t, http.MethodGet,
-		"/agencies/"+agencyID.String()+"/geofences?sort_by=home_agency&order=DESC", "", nil, agencyID)
+		"/agencies/"+agencyID.String()+"/geofences?sort_by=address&order=DESC", "", nil, agencyID)
 
 	ctrl.ListGeofences(c)
 
@@ -488,7 +524,24 @@ func TestListGeofences_SortsByHomeAgency(t *testing.T) {
 
 	resp := decodeListResponse(t, w)
 	if len(resp.Data) != 2 || resp.Data[0].Name != "Z" || resp.Data[1].Name != "A" {
-		t.Fatalf("got order %+v, want [Z, A] (desc by home_agency)", resp.Data)
+		t.Fatalf("got order %+v, want [Z, A] (desc by address)", resp.Data)
+	}
+}
+
+// TestListGeofences_RejectsSortByHomeAgency confirms home_agency is no
+// longer a sort_by value (it's an agency UUID, with nothing meaningful to
+// sort by).
+func TestListGeofences_RejectsSortByHomeAgency(t *testing.T) {
+	agencyID := uuid.New()
+	ctrl := newTestController(&fakeGeofenceDbAdapter{}, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet,
+		"/agencies/"+agencyID.String()+"/geofences?sort_by=home_agency", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
 	}
 }
 
@@ -656,22 +709,29 @@ func TestListGeofences_RejectsInvalidSortBy(t *testing.T) {
 
 // fieldFilterFixtures returns three geofences that differ by name, address
 // and exclude_from_colocation, for the per-field AND filter tests below.
+// Each fixture belongs to a different (sub)agency, so home_agency — the
+// owning agency_id — can tell them apart.
+const (
+	fixtureAgencyAtl  = "11111111-1111-1111-1111-111111111111"
+	fixtureAgencyBos  = "22222222-2222-2222-2222-222222222222"
+	fixtureAgencyCour = "33333333-3333-3333-3333-333333333333"
+)
+
 func fieldFilterFixtures(agencyID uuid.UUID) []*dbmodel.Geofence {
-	syn1, syn2, syn10 := "SYN1", "SYN2", "SYN10"
 	paroleAtl := namedGeofence(agencyID, "Parole Office Atlanta")
 	paroleAtl.GeoJSON = `{"type":"Circle","coordinates":[-84.388,33.749],"radius":500,"address":{"street1":"1 Peachtree St","city":"Atlanta"}}`
 	paroleAtl.ExcludeFromColocation = true
-	paroleAtl.SynergyIdentifier = &syn1
+	paroleAtl.AgencyID = uuid.MustParse(fixtureAgencyAtl)
 
 	paroleBos := namedGeofence(agencyID, "Parole Office Boston")
 	paroleBos.GeoJSON = `{"type":"Circle","coordinates":[-71.05,42.36],"radius":500,"address":{"street1":"2 Main St","city":"Boston"}}`
 	paroleBos.ExcludeFromColocation = true
-	paroleBos.SynergyIdentifier = &syn2
+	paroleBos.AgencyID = uuid.MustParse(fixtureAgencyBos)
 
 	courtAtl := namedGeofence(agencyID, "Courthouse")
 	courtAtl.GeoJSON = `{"type":"Circle","coordinates":[-84.39,33.75],"radius":500,"address":{"street1":"3 Main St","city":"Atlanta"}}`
 	courtAtl.ExcludeFromColocation = false
-	courtAtl.SynergyIdentifier = &syn10
+	courtAtl.AgencyID = uuid.MustParse(fixtureAgencyCour)
 
 	return []*dbmodel.Geofence{paroleAtl, paroleBos, courtAtl}
 }
@@ -698,14 +758,15 @@ func TestListGeofences_FieldFiltersAreANDed(t *testing.T) {
 		{name: "address AND not excluded", query: "address=main&exclude_from_colocation=false", want: []string{"Courthouse"}},
 		{name: "field filter AND q", query: "q=boston&exclude_from_colocation=true", want: []string{"Parole Office Boston"}},
 		{name: "no row satisfies all", query: "name=courthouse&exclude_from_colocation=true", want: nil},
-		{name: "home_agency exact, not substring", query: "home_agency=syn1", want: []string{"Parole Office Atlanta"}},
-		{name: "home_agency comma list is OR", query: "home_agency=SYN1,SYN10", want: []string{"Courthouse", "Parole Office Atlanta"}},
-		{name: "home_agency repeated is OR", query: "home_agency=SYN2&home_agency=SYN10", want: []string{"Courthouse", "Parole Office Boston"}},
-		{name: "home_agency list AND name", query: "home_agency=SYN1,SYN2,SYN10&name=parole", want: []string{"Parole Office Atlanta", "Parole Office Boston"}},
+		{name: "home_agency single agency", query: "home_agency=" + fixtureAgencyAtl + "", want: []string{"Parole Office Atlanta"}},
+		{name: "home_agency comma list is OR", query: "home_agency=" + fixtureAgencyAtl + "," + fixtureAgencyCour + "", want: []string{"Courthouse", "Parole Office Atlanta"}},
+		{name: "home_agency repeated is OR", query: "home_agency=" + fixtureAgencyBos + "&home_agency=" + fixtureAgencyCour + "", want: []string{"Courthouse", "Parole Office Boston"}},
+		{name: "home_agency list AND name", query: "home_agency=" + fixtureAgencyAtl + "," + fixtureAgencyBos + "," + fixtureAgencyCour + "&name=parole", want: []string{"Parole Office Atlanta", "Parole Office Boston"}},
+		{name: "home_agency outside the fetched rows matches nothing", query: "home_agency=" + uuid.NewString(), want: nil},
 		{name: "exclude true,false matches both", query: "exclude_from_colocation=true,false", want: []string{"Courthouse", "Parole Office Atlanta", "Parole Office Boston"}},
 		{name: "exclude repeated true and false", query: "exclude_from_colocation=true&exclude_from_colocation=false&address=atlanta", want: []string{"Courthouse", "Parole Office Atlanta"}},
 		{name: "exclude is case-insensitive", query: "exclude_from_colocation=FALSE", want: []string{"Courthouse"}},
-		{name: "mixed separators and blanks", query: "home_agency=SYN1,,%20SYN2&home_agency=", want: []string{"Parole Office Atlanta", "Parole Office Boston"}},
+		{name: "mixed separators and blanks", query: "home_agency=" + fixtureAgencyAtl + ",,%20" + fixtureAgencyBos + "&home_agency=", want: []string{"Parole Office Atlanta", "Parole Office Boston"}},
 		{name: "whitespace-only name is no filter", query: "name=%20%20", want: []string{"Courthouse", "Parole Office Atlanta", "Parole Office Boston"}},
 		{name: "padded name is trimmed", query: "name=%20parole%20", want: []string{"Parole Office Atlanta", "Parole Office Boston"}},
 	} {
@@ -747,14 +808,14 @@ func TestListGeofences_BodyFieldFiltersAreANDed(t *testing.T) {
 		want []string
 	}{
 		{name: "scalar values", body: `{"search":{"any":"office","address":"atlanta","exclude_from_colocation":true}}`, want: []string{"Parole Office Atlanta"}},
-		{name: "scalar home_agency", body: `{"search":{"home_agency":"SYN2"}}`, want: []string{"Parole Office Boston"}},
-		{name: "home_agency array is OR", body: `{"search":{"home_agency":["SYN1","SYN10"]},"data":{"sort_by":"name"}}`, want: []string{"Courthouse", "Parole Office Atlanta"}},
+		{name: "scalar home_agency", body: `{"search":{"home_agency":"` + fixtureAgencyBos + `"}}`, want: []string{"Parole Office Boston"}},
+		{name: "home_agency array is OR", body: `{"search":{"home_agency":["` + fixtureAgencyAtl + `","` + fixtureAgencyCour + `"]},"data":{"sort_by":"name"}}`, want: []string{"Courthouse", "Parole Office Atlanta"}},
 		{name: "exclude array true and false", body: `{"search":{"address":"atlanta","exclude_from_colocation":[true,false]},"data":{"sort_by":"name"}}`, want: []string{"Courthouse", "Parole Office Atlanta"}},
 		{name: "null home_agency and exclude are no filter", body: `{"search":{"home_agency":null,"exclude_from_colocation":null},"data":{"sort_by":"name"}}`, want: []string{"Courthouse", "Parole Office Atlanta", "Parole Office Boston"}},
 		{name: "empty arrays are no filter", body: `{"search":{"home_agency":[],"exclude_from_colocation":[]},"data":{"sort_by":"name"}}`, want: []string{"Courthouse", "Parole Office Atlanta", "Parole Office Boston"}},
 		{name: "blank home_agency entries are no filter", body: `{"search":{"home_agency":["", "  "]},"data":{"sort_by":"name"}}`, want: []string{"Courthouse", "Parole Office Atlanta", "Parole Office Boston"}},
 		{name: "whitespace-only name is no filter", body: `{"search":{"name":"   "},"data":{"sort_by":"name"}}`, want: []string{"Courthouse", "Parole Office Atlanta", "Parole Office Boston"}},
-		{name: "everything combined", body: `{"search":{"any":"office","home_agency":["SYN1","SYN2"],"exclude_from_colocation":[true]},"data":{"sort_by":"name"}}`, want: []string{"Parole Office Atlanta", "Parole Office Boston"}},
+		{name: "everything combined", body: `{"search":{"any":"office","home_agency":["` + fixtureAgencyAtl + `","` + fixtureAgencyBos + `"],"exclude_from_colocation":[true]},"data":{"sort_by":"name"}}`, want: []string{"Parole Office Atlanta", "Parole Office Boston"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences", tc.body, nil, agencyID)
@@ -777,7 +838,8 @@ func TestListGeofences_BodyFieldFiltersAreANDed(t *testing.T) {
 }
 
 // TestListGeofences_RejectsWrongTypeBodySearchField confirms a body
-// home_agency/exclude_from_colocation of the wrong JSON type is a 400.
+// home_agency/exclude_from_colocation of the wrong JSON type, or a
+// home_agency entry that isn't an agency UUID, is a 400.
 func TestListGeofences_RejectsWrongTypeBodySearchField(t *testing.T) {
 	agencyID := uuid.New()
 	ctrl := newTestController(&fakeGeofenceDbAdapter{}, &fakeActivityLogger{})
@@ -787,7 +849,9 @@ func TestListGeofences_RejectsWrongTypeBodySearchField(t *testing.T) {
 		`{"search":{"exclude_from_colocation":"yes"}}`,
 		`{"search":{"exclude_from_colocation":[true,"no"]}}`,
 		`{"search":{"exclude_from_colocation":[true,null]}}`,
-		`{"search":{"home_agency":["SYN1",null]}}`,
+		`{"search":{"home_agency":["` + fixtureAgencyAtl + `",null]}}`,
+		`{"search":{"home_agency":"SYN1"}}`,
+		`{"search":{"home_agency":["` + fixtureAgencyAtl + `","not-a-uuid"]}}`,
 	} {
 		c, w := newTestGinContext(t, http.MethodGet, "/agencies/"+agencyID.String()+"/geofences", body, nil, agencyID)
 
@@ -827,22 +891,38 @@ func TestListGeofences_RejectsInvalidExcludeFromColocation(t *testing.T) {
 	}
 }
 
-// TestListGeofences_BodyStillHonorsClientAndAgencyIDsQuery pins the
-// body-vs-query rule: with a body present, client_id and agency_ids (which
-// have no body field) are still read from the query string, while every
-// other query param — here name — is ignored in favor of the body.
-func TestListGeofences_BodyStillHonorsClientAndAgencyIDsQuery(t *testing.T) {
+func TestListGeofences_RejectsInvalidHomeAgencyQuery(t *testing.T) {
+	agencyID := uuid.New()
+	ctrl := newTestController(&fakeGeofenceDbAdapter{}, &fakeActivityLogger{})
+
+	c, w := newTestGinContext(t, http.MethodGet,
+		"/agencies/"+agencyID.String()+"/geofences?home_agency="+fixtureAgencyAtl+",SYN1", "", nil, agencyID)
+
+	ctrl.ListGeofences(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "home_agency") {
+		t.Fatalf("body = %s, want the error to name home_agency", w.Body.String())
+	}
+}
+
+// TestListGeofences_BodyStillHonorsClientIDQuery pins the body-vs-query
+// rule: with a body present, client_id (which has no body field) is still
+// read from the query string, while every other query param — here name —
+// is ignored in favor of the body.
+func TestListGeofences_BodyStillHonorsClientIDQuery(t *testing.T) {
 	agencyID := uuid.New()
 	clientID := uuid.New()
-	subAgencyID := uuid.New()
 
 	datasource := &fakeGeofenceDbAdapter{
 		findByAgencyAndClient: func(_ context.Context, _ uuid.UUID, gotClientID *uuid.UUID, _ *dbmodel.GeofenceStatus, gotAgencyIDs []uuid.UUID) ([]*dbmodel.Geofence, error) {
 			if gotClientID == nil || *gotClientID != clientID {
 				t.Fatalf("clientID = %v, want %v from the query string", gotClientID, clientID)
 			}
-			if len(gotAgencyIDs) != 1 || gotAgencyIDs[0] != subAgencyID {
-				t.Fatalf("agencyIDs = %v, want [%v] from the query string", gotAgencyIDs, subAgencyID)
+			if len(gotAgencyIDs) != 1 || gotAgencyIDs[0] != agencyID {
+				t.Fatalf("agencyIDs = %v, want [%v]", gotAgencyIDs, agencyID)
 			}
 			return fieldFilterFixtures(agencyID), nil
 		},
@@ -850,7 +930,7 @@ func TestListGeofences_BodyStillHonorsClientAndAgencyIDsQuery(t *testing.T) {
 	ctrl := newTestController(datasource, &fakeActivityLogger{})
 
 	c, w := newTestGinContext(t, http.MethodGet,
-		"/agencies/"+agencyID.String()+"/geofences?client_id="+clientID.String()+"&agency_ids="+subAgencyID.String()+"&name=courthouse",
+		"/agencies/"+agencyID.String()+"/geofences?client_id="+clientID.String()+"&name=courthouse",
 		`{"search":{"name":"parole"},"data":{"sort_by":"name"}}`, nil, agencyID)
 
 	ctrl.ListGeofences(c)

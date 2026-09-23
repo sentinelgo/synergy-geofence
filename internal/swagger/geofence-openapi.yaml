@@ -81,11 +81,15 @@ paths:
         list-users request) as an alternative to the query params below —
         when the body has none of `search`/`pagination`/`data`, is empty, or
         isn't JSON, every field falls back to its query param instead. When
-        a body *is* used, every query param is ignored except `client_id`
-        and `agency_ids`, which have no body field and are always read from
-        the query string. A 400 is returned for an invalid `client_id` /
-        `agency_ids` / `status` / `sort_by` / `includeSubagency` /
-        `exclude_from_colocation` query value (`ERR_INVALID_QUERY` et al.,
+        a body *is* used, every query param is ignored except `client_id`,
+        which has no body field and is always read from the query string.
+        The agency scope is always resolved server-side — the agency_id path
+        param, plus (with includeSubagency) the subagencies the caller may
+        see — and can only be narrowed further, via home_agency. A 400 is
+        returned for an invalid `client_id` / `status` / `sort_by` /
+        `includeSubagency` /
+        `home_agency` / `exclude_from_colocation` query value, or a
+        non-UUID `search.home_agency` entry (`ERR_INVALID_QUERY` et al.,
         naming the offending input), or for a malformed body — including a
         wrong-typed or null-containing `search.home_agency` /
         `search.exclude_from_colocation` (`ERR_BIND_PAYLOAD`, input
@@ -106,10 +110,10 @@ paths:
                 summary: Search by address
                 value:
                   search: { any: 'Main St' }
-              searchByHomeAgency:
-                summary: Search by owning agency's synergy identifier
+              filterByHomeAgency:
+                summary: Only geofences owned by these (sub)agencies
                 value:
-                  search: { any: 'SYN123' }
+                  search: { home_agency: ['8396b27b-95ef-45cb-9b4c-1132812a33e1', '5c2e9a4d-1f3b-4d7e-8a6c-2b9f0e1d3c4a'] }
               searchByExcludedFromColocation:
                 summary: Only geofences excluded from co-location
                 value:
@@ -117,13 +121,13 @@ paths:
               fieldFiltersAnded:
                 summary: Per-field filters (ANDed with each other and search.any)
                 value:
-                  search: { any: 'office', name: 'parole', address: 'atlanta', home_agency: ['SYN1', 'SYN2'], exclude_from_colocation: [true] }
+                  search: { any: 'office', name: 'parole', address: 'atlanta', home_agency: ['8396b27b-95ef-45cb-9b4c-1132812a33e1', '5c2e9a4d-1f3b-4d7e-8a6c-2b9f0e1d3c4a'], exclude_from_colocation: [true] }
               searchSortAndPaginate:
                 summary: Combine search, sort, and pagination
                 value:
                   search: { any: 'springfield' }
                   pagination: { limit: 25, page: 2 }
-                  data: { sort_by: home_agency, order: desc, include_subagency: true }
+                  data: { sort_by: address, order: desc, include_subagency: true }
       parameters:
         - name: client_id
           in: query
@@ -147,15 +151,15 @@ paths:
             |---|---|
             | name | The geofence's name. |
             | address | The geo_json address object, flattened to text (street, city, state/province, postal code). |
-            | home_agency | The owning agency's synergy identifier (see sort_by's home_agency description) — not a human-readable agency name. |
             | exclude_from_colocation | Matched as plain text against `"true"`/`"false"` — not a boolean filter. `q=true` matches every excluded geofence, `q=false` every included one. |
 
             Coordinates and radius are not searchable — they're numeric,
             not text, and rarely known/typed by a caller. A query shorter
             than 3 characters is treated as invalid and matches nothing
             (returns an empty page, not a 400) — the same minimum
-            sso-agency-service's agency search uses. Examples: `Downtown`,
-            `Main St`, `SYN123`, `true`.
+            sso-agency-service's agency search uses. The owning (home)
+            agency isn't text-searchable — filter it by UUID with
+            home_agency instead. Examples: `Downtown`, `Main St`, `true`.
           examples:
             name:
               summary: Search by name
@@ -163,9 +167,6 @@ paths:
             address:
               summary: Search by address
               value: 'Main St'
-            homeAgency:
-              summary: Search by owning agency's synergy identifier
-              value: 'SYN123'
             excludedFromColocation:
               summary: Only geofences excluded from co-location
               value: 'true'
@@ -183,7 +184,7 @@ paths:
             minimum for these. home_agency and exclude_from_colocation
             accept several values (see their own descriptions). Omit a
             param to not filter on that field. Example:
-            `?name=parole&address=atlanta&home_agency=SYN1,SYN2&exclude_from_colocation=true`.
+            `?name=parole&address=atlanta&home_agency=8396b27b-95ef-45cb-9b4c-1132812a33e1,5c2e9a4d-1f3b-4d7e-8a6c-2b9f0e1d3c4a&exclude_from_colocation=true`.
           example: 'Parole'
         - name: address
           in: query
@@ -205,14 +206,18 @@ paths:
             type: array
             items:
               type: string
+              format: uuid
           description: >
-            One or more owning-agency synergy identifiers, either repeated
-            (`?home_agency=SYN1&home_agency=SYN2`) or comma-separated
-            (`?home_agency=SYN1,SYN2`). Matches a geofence whose home agency
-            equals *any* of them (OR within this field) — an exact,
-            case-insensitive match, not a substring, so SYN1 doesn't also
-            match SYN10. ANDed with the other filters and q.
-          example: ['SYN1', 'SYN2']
+            One or more agency UUIDs, either repeated
+            (`?home_agency=<uuid1>&home_agency=<uuid2>`) or comma-separated
+            (`?home_agency=<uuid1>,<uuid2>`). A geofence's home agency is
+            the agency that owns it (its agency_id), so this matches
+            geofences owned by *any* of the given agencies (OR within this
+            field), ANDed with the other filters and q. It only narrows the
+            agency scope already being listed (the path agency, plus
+            subagencies with includeSubagency) — it never widens it. A
+            non-UUID entry is a 400.
+          example: ['8396b27b-95ef-45cb-9b4c-1132812a33e1', '5c2e9a4d-1f3b-4d7e-8a6c-2b9f0e1d3c4a']
         - name: exclude_from_colocation
           in: query
           style: form
@@ -229,17 +234,19 @@ paths:
             `true`/`false` are accepted (case-insensitive) — any other entry,
             including shorthands like `1`, `0`, `t` or `f`, is a 400.
           example: [true]
-        - name: agency_ids
-          in: query
-          schema:
-            type: string
-          description: Comma-separated agency UUIDs to include in the list query when includeSubagency=true.
         - name: includeSubagency
           in: query
           schema:
             type: boolean
             default: false
-          description: Include subagency UUIDs from agency_ids in the list query.
+          description: >
+            Also list the path agency's subagencies — resolved live via the
+            agency service, limited to the ones the caller is allowed to see
+            (all of them for System/Global/Read-Only Administrators,
+            otherwise only associated agencies; the whole hierarchy when JWT
+            verification is disabled, a dev-only setting). Use home_agency
+            to narrow to specific ones. If the agency service call fails,
+            the request fails with 502 `ERR_AGENCY_SERVICE`.
         - name: status
           in: query
           schema:
@@ -261,8 +268,8 @@ paths:
           in: query
           schema:
             type: string
-            enum: [name, exclude_from_colocation, home_agency, address]
-          description: Field to sort by, applied in memory after the DB fetch (see the q parameter above) — exactly the same fields search covers. home_agency sorts by the owning agency's synergy identifier. address sorts by the geofence's street address; geofences with no address sort last regardless of direction. Coordinates/radius aren't sortable (same reason they aren't searchable). Omit to keep the default (most recently created first).
+            enum: [name, exclude_from_colocation, address]
+          description: Field to sort by, applied in memory after the DB fetch (see the q parameter above) — exactly the same fields q searches. address sorts by the geofence's street address; geofences with no address sort last regardless of direction. Coordinates/radius aren't sortable (same reason they aren't searchable). Omit to keep the default (most recently created first).
         - name: order
           in: query
           schema:
@@ -278,8 +285,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/GeofenceListResponse'
               examples:
-                nameOrAddressOrHomeAgencyMatch:
-                  summary: A Circle geofence matching a name/address/home_agency search
+                nameOrAddressMatch:
+                  summary: A Circle geofence matching a name/address search
                   value:
                     data:
                       - id: c1a1a7f0-1234-4a2b-9c3d-000000000001
@@ -312,6 +319,8 @@ paths:
                     meta: { limit: 25, page: 1, pages: 1, total: 1 }
         '400':
           $ref: '#/components/responses/BadRequest'
+        '502':
+          $ref: '#/components/responses/BadGateway'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -489,6 +498,12 @@ components:
       description: Propagated through to logs via log.CorrelationIdMiddleware; the caller may supply one, otherwise it is simply absent from log correlation.
 
   responses:
+    BadGateway:
+      description: An upstream agency-service call failed (e.g. the includeSubagency hierarchy lookup) — code ERR_AGENCY_SERVICE, input agency_id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
     BadRequest:
       description: Invalid request (bad UUID, failed JSON binding, invalid geometry, etc).
       content:
@@ -793,8 +808,8 @@ components:
         none of those three keys are present — including an empty or
         non-JSON body — every field falls back to its query-string
         equivalent instead. When the body is used, every query param is
-        ignored except client_id and agency_ids (no body field; always read
-        from the query string).
+        ignored except client_id (no body field; always read from the query
+        string).
       properties:
         search:
           type: object
@@ -818,7 +833,6 @@ components:
                 |---|---|
                 | name | The geofence's name. |
                 | address | The geo_json address object, flattened to text (street, city, state/province, postal code). |
-                | home_agency | The owning agency's synergy identifier — not a human-readable agency name. |
                 | exclude_from_colocation | Matched as plain text against `"true"`/`"false"` — not a boolean filter. `true` matches every excluded geofence, `false` every included one. |
 
                 Coordinates and radius are not searchable. A value shorter
@@ -845,13 +859,14 @@ components:
                 - type: array
                   items:
                     type: string
+                    format: uuid
               description: >
-                Equivalent to the home_agency query param — a single owning
-                agency synergy identifier or an array of them. Matches a
-                geofence whose home agency equals *any* value (OR within
-                this field; exact, case-insensitive, not a substring), ANDed
-                with the other search fields and any.
-              example: ['SYN1', 'SYN2']
+                Equivalent to the home_agency query param — a single agency
+                UUID or an array of them. Matches geofences owned by *any*
+                of these agencies (OR within this field), ANDed with the
+                other search fields and any; only narrows the listed agency
+                scope, never widens it.
+              example: ['8396b27b-95ef-45cb-9b4c-1132812a33e1', '5c2e9a4d-1f3b-4d7e-8a6c-2b9f0e1d3c4a']
             exclude_from_colocation:
               oneOf:
                 - type: boolean
@@ -895,20 +910,6 @@ components:
                 Use the client_id query parameter to filter to a specific
                 client; it works regardless of whether search/pagination/data
                 are also supplied in the body.
-            agency_ids:
-              type: array
-              deprecated: true
-              items:
-                type: string
-                format: uuid
-              description: >
-                Not supported in the request body — this field is ignored.
-                Use the agency_ids query parameter for an explicit,
-                caller-resolved subagency scope; like client_id, it's still
-                honored alongside a body. include_subagency below
-                still works from the body: with no agency_ids override, it
-                resolves the subagency hierarchy live via the agency
-                service, keyed off the agency_id path param.
             status:
               type: string
               enum: [active, inactive, archived, deleted]
@@ -919,16 +920,15 @@ components:
               example: active
             sort_by:
               type: string
-              enum: [name, exclude_from_colocation, home_agency, address]
+              enum: [name, exclude_from_colocation, address]
               description: >
                 Equivalent to the sort_by query param, applied in memory
-                after the DB fetch. home_agency sorts by the owning
-                agency's synergy identifier; address sorts by the
+                after the DB fetch. address sorts by the
                 geofence's street address (geofences with no address sort
                 last, regardless of direction). Coordinates/radius aren't
                 sortable (same reason they aren't searchable). Omit to
                 keep the default order (most recently created first).
-              example: home_agency
+              example: name
             order:
               type: string
               enum: [asc, desc]

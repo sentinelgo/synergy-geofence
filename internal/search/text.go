@@ -1,5 +1,6 @@
 // Package search implements ListGeofences' in-memory search matching —
-// name/address/home_agency/exclude_from_colocation, no coordinates/radius —
+// name/address/exclude_from_colocation (plus a home_agency agency-ID
+// filter), no coordinates/radius —
 // applied to an already-fetched []*dbmodel.Geofence slice (see
 // GeofenceController.ListGeofences), not pushed into SQL. This mirrors the
 // fetch-broadly-then-filter/sort/paginate-in-Go pattern sso-agency-service's
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
 	dbmodel "github.com/sentinelgo/synergy-geofence/internal/database/model"
 )
 
@@ -24,16 +26,15 @@ const MinQueryLen = 3
 
 // MatchesQuery reports whether g matches a plain, case-insensitive
 // substring search: query matches if it appears in the geofence's name,
-// its flattened address (see AddressText), homeAgency (the owning agency's
-// synergy identifier — pass g.SynergyIdentifier dereferenced, or "" if
-// nil), or the "true"/"false" text of exclude_from_colocation (so
+// its flattened address (see AddressText), or the "true"/"false" text of
+// exclude_from_colocation (so
 // query="true" matches every excluded geofence, "false" every included
 // one — not a boolean-typed filter, just one more string field). An
 // empty/blank query matches everything; a query shorter than MinQueryLen
 // matches nothing (see its doc comment). There is no section-prefix syntax
 // and no boolean operators — coordinates and radius are not searchable
 // this way (they aren't meaningful text search targets).
-func MatchesQuery(g *dbmodel.Geofence, homeAgency, query string) bool {
+func MatchesQuery(g *dbmodel.Geofence, query string) bool {
 	query = strings.ToLower(strings.TrimSpace(query))
 	if query == "" {
 		return true
@@ -50,9 +51,6 @@ func MatchesQuery(g *dbmodel.Geofence, homeAgency, query string) bool {
 	if strings.Contains(strings.ToLower(AddressText(g.GeoJSON)), query) {
 		return true
 	}
-	if strings.Contains(strings.ToLower(homeAgency), query) {
-		return true
-	}
 	if strings.Contains(strconv.FormatBool(g.ExcludeFromColocation), query) {
 		return true
 	}
@@ -64,35 +62,35 @@ func MatchesQuery(g *dbmodel.Geofence, homeAgency, query string) bool {
 // contains it, every set field here must match (AND) — and they AND with
 // the free-text query too. Name/Address are plain, case-insensitive
 // substring matches against the same text MatchesQuery searches.
-// HomeAgencies and ExcludeFromColocation are lists — a geofence matches if
-// it equals *any* value in the list (OR within the field): HomeAgencies
-// compares the owning agency's synergy identifier exactly (ignoring case,
-// so "SYN1" doesn't also match "SYN10"), ExcludeFromColocation the
-// boolean flag (so [true, false] matches everything). A blank string or
-// empty list means "no filter on this field". There is no MinQueryLen
+// HomeAgencyIDs and ExcludeFromColocation are lists — a geofence matches
+// if it equals *any* value in the list (OR within the field):
+// HomeAgencyIDs compares the owning agency (Geofence.AgencyID — a
+// geofence's home agency is simply the agency it belongs to),
+// ExcludeFromColocation the boolean flag (so [true, false] matches
+// everything). A blank string or empty list means "no filter on this
+// field". HomeAgencyIDs only narrows the rows already fetched for the
+// caller's authorized agency scope — it never widens it. There is no MinQueryLen
 // floor here: a field filter is an explicit, targeted ask rather than a
 // type-ahead search box, so even a one-character value is honored.
 type FieldFilters struct {
 	Name                  string
 	Address               string
-	HomeAgencies          []string
+	HomeAgencyIDs         []uuid.UUID
 	ExcludeFromColocation []bool
 }
 
-// IsZero reports whether no field filter is set. Blank strings — Name,
-// Address or HomeAgencies entries — don't count as set.
+// IsZero reports whether no field filter is set. Blank Name/Address
+// strings don't count as set.
 func (f FieldFilters) IsZero() bool {
 	return strings.TrimSpace(f.Name) == "" &&
 		strings.TrimSpace(f.Address) == "" &&
-		!slices.ContainsFunc(f.HomeAgencies, isNotBlank) &&
+		len(f.HomeAgencyIDs) == 0 &&
 		len(f.ExcludeFromColocation) == 0
 }
 
 // MatchesFields reports whether g satisfies every set filter in f (see
-// FieldFilters). homeAgency is passed the same way as for MatchesQuery.
-// Blank HomeAgencies entries are ignored, so a list of only blanks is no
-// filter rather than a match on "no home agency".
-func MatchesFields(g *dbmodel.Geofence, homeAgency string, f FieldFilters) bool {
+// FieldFilters).
+func MatchesFields(g *dbmodel.Geofence, f FieldFilters) bool {
 	if f.IsZero() {
 		return true
 	}
@@ -107,20 +105,13 @@ func MatchesFields(g *dbmodel.Geofence, homeAgency string, f FieldFilters) bool 
 	if strings.TrimSpace(f.Address) != "" && !containsFold(AddressText(g.GeoJSON), f.Address) {
 		return false
 	}
-	if slices.ContainsFunc(f.HomeAgencies, isNotBlank) && !slices.ContainsFunc(f.HomeAgencies, func(v string) bool {
-		v = strings.TrimSpace(v)
-		return v != "" && strings.EqualFold(v, homeAgency)
-	}) {
+	if len(f.HomeAgencyIDs) > 0 && !slices.Contains(f.HomeAgencyIDs, g.AgencyID) {
 		return false
 	}
 	if len(f.ExcludeFromColocation) > 0 && !slices.Contains(f.ExcludeFromColocation, g.ExcludeFromColocation) {
 		return false
 	}
 	return true
-}
-
-func isNotBlank(s string) bool {
-	return strings.TrimSpace(s) != ""
 }
 
 // containsFold reports whether s contains substr, case-insensitively,

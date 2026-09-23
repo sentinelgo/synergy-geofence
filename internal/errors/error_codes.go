@@ -42,6 +42,9 @@ const (
 	ErrInvalidName     = "ERR_INVALID_NAME"
 	ErrCommon          = "ERR_COMMON"
 	ErrAuth            = "ERR_AUTH"
+	// ErrAgencyService means an upstream agency-service call (e.g. the
+	// subagency hierarchy lookup) failed — an outage, not an auth problem.
+	ErrAgencyService = "ERR_AGENCY_SERVICE"
 )
 
 type ErrorInput string

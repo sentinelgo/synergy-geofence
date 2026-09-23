@@ -37,13 +37,8 @@ type GeofenceDbAdapter interface {
 	// sso-agency-service's search already uses, rather than an Oracle Text
 	// index or SQL ORDER BY/LIMIT.
 	FindByAgencyAndClient(ctx context.Context, agencyID uuid.UUID, clientID *uuid.UUID, status *model.GeofenceStatus, agencyIDs []uuid.UUID) ([]*model.Geofence, error)
-	// homeAgency on CreateGeofence/UpdateGeofence is the owning agency's
-	// synergy_identifier, already resolved by the controller (the Geofence
-	// model only stores AgencyID) — stored on the row so ListGeofences can
-	// search/sort by it in memory without a live agency-service call per
-	// request (see internal/search).
-	CreateGeofence(ctx context.Context, g *model.Geofence, homeAgency string) error
-	UpdateGeofence(ctx context.Context, g *model.Geofence, homeAgency string, selectFields ...any) error
+	CreateGeofence(ctx context.Context, g *model.Geofence) error
+	UpdateGeofence(ctx context.Context, g *model.Geofence, selectFields ...any) error
 	// DeleteGeofence hard-deletes the row: DELETE, not a status flip. This
 	// is required so a deleted location's name is immediately free for
 	// reuse within the agency (uni_geofence_agency_name has no status
@@ -77,7 +72,7 @@ type dbAdapter struct {
 var geofenceReadColumns = []string{
 	"id", "created_at", "updated_at", "version",
 	"agency_id", "client_id", "name", "type", "geo_json", "status",
-	"exclude_from_colocation", "notes", "synergy_identifier", "created_by", "updated_by",
+	"exclude_from_colocation", "notes", "created_by", "updated_by",
 }
 
 func (dbc *dbAdapter) FindByID(ctx context.Context, agencyID, id uuid.UUID) (*model.Geofence, error) {
@@ -128,11 +123,10 @@ func (dbc *dbAdapter) FindByAgencyAndClient(ctx context.Context, agencyID uuid.U
 // invoking GormValue, and go-ora rejects it as an unregistered user-defined
 // type. InlineSQL sidesteps that entirely by embedding the SDO_GEOMETRY
 // constructor as a literal.
-func (dbc *dbAdapter) CreateGeofence(ctx context.Context, g *model.Geofence, homeAgency string) error {
+func (dbc *dbAdapter) CreateGeofence(ctx context.Context, g *model.Geofence) error {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	g.CreatedAt = now
 	g.UpdatedAt = &now
-	g.SynergyIdentifier = stringPtrOrNil(homeAgency)
 
 	// updated_at is NOT NULL but has no DB-level DEFAULT (GORM's
 	// autoUpdateTime tag only populates it via the normal callback
@@ -140,15 +134,15 @@ func (dbc *dbAdapter) CreateGeofence(ctx context.Context, g *model.Geofence, hom
 	// matching created_at on first insert.
 	query := fmt.Sprintf(`INSERT INTO geofence_rules (
 		id, created_at, updated_at, version, agency_id, client_id, name, type, geometry, geo_json, status,
-		exclude_from_colocation, notes, synergy_identifier, created_by
+		exclude_from_colocation, notes, created_by
 	) VALUES (
 		:id, :created_at, :updated_at, :version, :agency_id, :client_id, :name, :type, %s, :geo_json, :status,
-		:exclude_from_colocation, :notes, :synergy_identifier, :created_by
+		:exclude_from_colocation, :notes, :created_by
 	)`, g.Geometry.InlineSQL())
 
 	args := []interface{}{
 		uuidBytes(g.ID), g.CreatedAt, now, g.Version, uuidBytes(g.AgencyID), uuidBytesPtr(g.ClientID), g.Name, int(g.Type),
-		g.GeoJSON, int(g.Status), boolToInt(g.ExcludeFromColocation), g.Notes, g.SynergyIdentifier, uuidBytes(g.CreatedBy),
+		g.GeoJSON, int(g.Status), boolToInt(g.ExcludeFromColocation), g.Notes, uuidBytes(g.CreatedBy),
 	}
 
 	return dbc.WithGormDB(ctx, func(db *gorm.DB) error {
@@ -159,9 +153,7 @@ func (dbc *dbAdapter) CreateGeofence(ctx context.Context, g *model.Geofence, hom
 // updateColumnSQL maps a selectable field name to its `column = :bind` SQL
 // fragment, for UpdateGeofence's dynamic SET clause. geometry has no entry
 // here — it's always inlined directly (see UpdateGeofence), for the same
-// GormValuerInterface gap CreateGeofence works around. synergy_identifier is
-// also handled specially — it's always refreshed from homeAgency when any
-// search-affecting field is updated.
+// GormValuerInterface gap CreateGeofence works around.
 var updateColumnSQL = map[string]string{
 	"name":                    "name = :name",
 	"type":                    "type = :type",
@@ -181,36 +173,9 @@ var updateColumnSQL = map[string]string{
 // is empty it updates every mutable business column, including geometry;
 // pass an explicit subset (e.g. just "status", "updated_by") for partial
 // updates that must leave geometry/geo_json/etc. untouched.
-// synergy_identifier is automatically refreshed from homeAgency whenever any
-// search-affecting field is updated (name, type, status, exclude_from_colocation, geo_json).
-func (dbc *dbAdapter) UpdateGeofence(ctx context.Context, g *model.Geofence, homeAgency string, selectFields ...any) error {
+func (dbc *dbAdapter) UpdateGeofence(ctx context.Context, g *model.Geofence, selectFields ...any) error {
 	if len(selectFields) == 0 {
 		selectFields = []any{"name", "type", "geometry", "geo_json", "status", "client_id", "exclude_from_colocation", "notes", "updated_by"}
-	}
-
-	// Check if any search-affecting fields are being updated
-	searchAffected := false
-	for _, f := range selectFields {
-		name, ok := f.(string)
-		if !ok {
-			continue
-		}
-		switch name {
-		case "name", "type", "status", "exclude_from_colocation", "geo_json":
-			searchAffected = true
-		}
-	}
-	if searchAffected {
-		// A failed/skipped lookup (homeAgency == "", see
-		// GeofenceController.resolveHomeAgency) must not blank out an
-		// already-known synergy_identifier on an update that has nothing to
-		// do with the agency — fall back to the value FindByID already
-		// loaded onto g rather than overwriting it with NULL.
-		effectiveHomeAgency := homeAgency
-		if effectiveHomeAgency == "" && g.SynergyIdentifier != nil {
-			effectiveHomeAgency = *g.SynergyIdentifier
-		}
-		g.SynergyIdentifier = stringPtrOrNil(effectiveHomeAgency)
 	}
 
 	argByField := map[string]interface{}{
@@ -222,7 +187,6 @@ func (dbc *dbAdapter) UpdateGeofence(ctx context.Context, g *model.Geofence, hom
 		"exclude_from_colocation": boolToInt(g.ExcludeFromColocation),
 		"notes":                   g.Notes,
 		"updated_by":              uuidBytesPtr(g.UpdatedBy),
-		"synergy_identifier":      g.SynergyIdentifier,
 	}
 
 	var setSQL []string
@@ -239,12 +203,6 @@ func (dbc *dbAdapter) UpdateGeofence(ctx context.Context, g *model.Geofence, hom
 		}
 		setSQL = append(setSQL, frag)
 		args = append(args, argByField[name])
-	}
-	// Always include synergy_identifier if search-affecting fields changed —
-	// it's refreshed from the same resolved homeAgency value.
-	if searchAffected {
-		setSQL = append(setSQL, "synergy_identifier = :synergy_identifier")
-		args = append(args, argByField["synergy_identifier"])
 	}
 	if len(setSQL) == 0 {
 		return nil
@@ -317,17 +275,6 @@ func uuidBytesPtr(id *uuid.UUID) []byte {
 	}
 	b := *id
 	return b[:]
-}
-
-// stringPtrOrNil returns nil for an empty string rather than a pointer to
-// "", so a failed/skipped home agency lookup (see
-// GeofenceController.resolveHomeAgency) stores SQL NULL instead of an empty
-// string in synergy_identifier.
-func stringPtrOrNil(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
 }
 
 // FindContainingPoint returns active geofences (scoped to agencyID, and

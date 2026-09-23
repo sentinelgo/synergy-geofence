@@ -100,17 +100,8 @@ type Geofence struct {
 	ExcludeFromColocation bool             `json:"exclude_from_colocation" gorm:"column:exclude_from_colocation;type:numeric(1);not null;default:0" mapstructure:"exclude_from_colocation"`
 	Notes                 *string          `json:"notes,omitempty" gorm:"column:notes;type:varchar2;size:500" mapstructure:"notes"`
 
-	// SynergyIdentifier is the owning agency's synergy identifier (see
-	// agencyClient.FetchAgencyDetails), denormalized here so ListGeofences
-	// can search/sort by it in memory without a live agency-service call
-	// per request (see internal/search, GeofenceController.ListGeofences).
-	// It's resolved externally (this service has no local agency table) and
-	// refreshed on any update that touches a search-affecting field (see
-	// UpdateGeofence's searchTextAffected); NULL until a row's first such
-	// write after this column existed.
-	SynergyIdentifier *string    `json:"-" gorm:"column:synergy_identifier;type:varchar2;size:100" mapstructure:"-"`
-	CreatedBy         uuid.UUID  `json:"created_by" gorm:"column:created_by;type:uuid;<-:create;not null" mapstructure:"created_by"`
-	UpdatedBy         *uuid.UUID `json:"updated_by,omitempty" gorm:"column:updated_by;type:uuid" mapstructure:"updated_by"`
+	CreatedBy uuid.UUID  `json:"created_by" gorm:"column:created_by;type:uuid;<-:create;not null" mapstructure:"created_by"`
+	UpdatedBy *uuid.UUID `json:"updated_by,omitempty" gorm:"column:updated_by;type:uuid" mapstructure:"updated_by"`
 }
 
 func (t *Geofence) TableName() string {

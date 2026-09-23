@@ -163,18 +163,18 @@ func Execute() {
 	activityLog := audit.NewLogger(auditCfg, l)
 
 	// m2mAcli authenticates every outbound call to the agency service's m2m
-	// endpoints (subagency hierarchy, home-agency profile) via the
+	// subagency hierarchy endpoint via the
 	// agency.read-scoped client_credentials grant (common.agency.client-
 	// credentials — a confidential Hydra client using client_secret_basic
 	// per environment). A build failure here (e.g. not configured yet in
 	// this environment) degrades gracefully to gohttp.DefaultClient rather
 	// than blocking startup — newAgencyClient's own baseURL/nil checks
-	// already make those m2m calls fail gracefully at call time (see
-	// resolveListAgencyIDs/resolveHomeAgency), the same way an unset
+	// already make that m2m call fail gracefully at call time (see
+	// resolveListAgencyIDs), the same way an unset
 	// common.agency.base-url does today.
 	m2mAcli, m2mAcliErr := cfg.Common.Agency.ClientCredentials.Client(context.Background())
 	if m2mAcliErr != nil {
-		l.With("error", m2mAcliErr).Warn("could not build agency m2m client, subagency/home-agency lookups will fail gracefully")
+		l.With("error", m2mAcliErr).Warn("could not build agency m2m client, subagency lookups will fail gracefully")
 		m2mAcli = gohttp.DefaultClient
 	}
 
