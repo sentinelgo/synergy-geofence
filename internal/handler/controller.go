@@ -36,6 +36,11 @@ const (
 	defaultPage     = 1
 	defaultPageSize = 25
 	maxPageSize     = 200
+	// allPageSize (page_size=0 / pagination.limit=0) disables pagination:
+	// ListGeofences returns every matching row as a single page. It costs no
+	// extra DB work — the full result set is already fetched before
+	// in-memory pagination — only a larger response.
+	allPageSize = 0
 )
 
 type GeofenceController struct {
@@ -245,8 +250,11 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 
 	total := len(matched)
 	pages := 0
-	if filters.pageSize > 0 {
+	switch {
+	case filters.pageSize > 0:
 		pages = int(math.Ceil(float64(total) / float64(filters.pageSize)))
+	case total > 0: // allPageSize: everything on one page
+		pages = 1
 	}
 
 	start := (filters.page - 1) * filters.pageSize
@@ -875,19 +883,12 @@ func parseOptionalUUIDQuery(c *gin.Context, key string) (*uuid.UUID, error) {
 }
 
 func parsePagination(c *gin.Context) (page, pageSize int) {
-	page = defaultPage
-	pageSize = defaultPageSize
-
-	if raw := c.Query("page"); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
-			page = v
-		}
+	var pagePtr, pageSizePtr *int
+	if v, err := strconv.Atoi(c.Query("page")); err == nil {
+		pagePtr = &v
 	}
-	if raw := c.Query("page_size"); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v > 0 && v <= maxPageSize {
-			pageSize = v
-		}
+	if v, err := strconv.Atoi(c.Query("page_size")); err == nil {
+		pageSizePtr = &v
 	}
-
-	return page, pageSize
+	return paginationFromValues(pagePtr, pageSizePtr)
 }

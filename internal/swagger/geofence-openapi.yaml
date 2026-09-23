@@ -262,8 +262,15 @@ paths:
           in: query
           schema:
             type: integer
+            minimum: 0
             default: 25
-            maximum: 200
+          description: >
+            Rows per page. `0` disables pagination: every matching row is
+            returned as a single page (page is ignored; meta reports
+            limit 0, page 1, pages 1 — or 0 when nothing matches). Values
+            above 200 are capped at 200; absent, negative or non-numeric
+            values use the default 25.
+          example: 0
         - name: sort_by
           in: query
           schema:
@@ -886,10 +893,13 @@ components:
           properties:
             limit:
               type: integer
-              minimum: 1
-              maximum: 200
+              minimum: 0
               default: 25
-              description: Page size, equivalent to the page_size query param.
+              description: >
+                Page size, equivalent to the page_size query param: `0`
+                returns every matching row as a single page (page is
+                ignored); values above 200 are capped at 200; absent or
+                negative uses the default 25.
               example: 25
             page:
               type: integer
@@ -958,6 +968,7 @@ components:
           properties:
             limit:
               type: integer
+              description: Effective page size — 0 when pagination was disabled (page_size / limit 0).
             page:
               type: integer
             pages:

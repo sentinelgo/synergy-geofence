@@ -475,16 +475,27 @@ func parseStatusValue(raw string) (*dbmodel.GeofenceStatus, error) {
 	return &s, nil
 }
 
-// paginationFromValues is parsePagination's source-agnostic core for the
-// body path (Page/Limit there are already *int, not query strings).
+// paginationFromValues resolves page/page size for both the query string
+// (page, page_size — see parsePagination) and the body (pagination.page,
+// pagination.limit). nil means absent. Page size: absent or negative →
+// defaultPageSize; 0 → allPageSize (no pagination: every row, as page 1);
+// above maxPageSize → capped at maxPageSize (not silently reset to the
+// default). Page: absent or below 1 → defaultPage.
 func paginationFromValues(page, pageSize *int) (int, int) {
 	p := defaultPage
 	ps := defaultPageSize
 	if page != nil && *page > 0 {
 		p = *page
 	}
-	if pageSize != nil && *pageSize > 0 && *pageSize <= maxPageSize {
-		ps = *pageSize
+	if pageSize != nil {
+		switch {
+		case *pageSize == allPageSize:
+			return defaultPage, allPageSize
+		case *pageSize > maxPageSize:
+			ps = maxPageSize
+		case *pageSize > 0:
+			ps = *pageSize
+		}
 	}
 	return p, ps
 }
