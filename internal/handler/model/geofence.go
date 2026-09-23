@@ -47,18 +47,32 @@ func StatusToDB(s string) dbmodel.GeofenceStatus {
 	return status
 }
 
+// Address mirrors components.schemas.Address, a structured physical address
+// attached to a geometry.
+type Address struct {
+	Name              string `json:"name,omitempty"`
+	Street1           string `json:"street1,omitempty"`
+	Street2           string `json:"street2,omitempty"`
+	City              string `json:"city,omitempty"`
+	StateProvinceID   int    `json:"state_province_id,omitempty"`
+	StateProvince     string `json:"state_province,omitempty"`
+	StateProvinceName string `json:"state_province_name,omitempty"`
+	PostalCode        string `json:"postal_code,omitempty"`
+	Country           string `json:"country,omitempty"`
+}
+
 // GeoJsonPoint mirrors components.schemas.GeoJsonPoint.
 type GeoJsonPoint struct {
 	Type        string        `json:"type"`
 	Coordinates spatial.Point `json:"coordinates"`
-	Address     *string       `json:"address,omitempty"`
+	Address     *Address      `json:"address,omitempty"`
 }
 
 // GeoJsonPolygon mirrors components.schemas.GeoJsonPolygon.
 type GeoJsonPolygon struct {
 	Type        string         `json:"type"`
 	Coordinates []spatial.Ring `json:"coordinates"`
-	Address     *string        `json:"address,omitempty"`
+	Address     *Address       `json:"address,omitempty"`
 }
 
 // GeoJsonRectangle extends the OpenAPI GeoJson oneOf (absent from the
@@ -70,7 +84,7 @@ type GeoJsonPolygon struct {
 type GeoJsonRectangle struct {
 	Type        string           `json:"type"`
 	Coordinates [2]spatial.Point `json:"coordinates"`
-	Address     *string          `json:"address,omitempty"`
+	Address     *Address         `json:"address,omitempty"`
 }
 
 // GeoJsonCircle mirrors components.schemas.GeoJsonCircle.
@@ -78,7 +92,7 @@ type GeoJsonCircle struct {
 	Type        string        `json:"type"`
 	Coordinates spatial.Point `json:"coordinates"`
 	Radius      float64       `json:"radius"`
-	Address     *string       `json:"address,omitempty"`
+	Address     *Address      `json:"address,omitempty"`
 }
 
 // GeoJson is a hand-rolled discriminated union over the `type` field,
@@ -177,11 +191,98 @@ type GeofenceRequest struct {
 	Notes                 *string    `json:"notes,omitempty" binding:"omitempty,max=500"`
 }
 
-// UpdateGeofenceRequest is a GeofenceRequest plus the version required for
-// the optimistic-concurrency check on PUT.
-type UpdateGeofenceRequest struct {
-	GeofenceRequest
-	Version uint64 `json:"version" binding:"required"`
+// PatchGeofenceRequest is a partial update for PATCH: every business field
+// is optional, and a field absent from the request body leaves the
+// existing value untouched (JSON Merge Patch-style — RFC 7396). ClientID
+// and Notes are nullable, so "absent" and "explicit null" are ambiguous on
+// a plain pointer; clientIDSet/notesSet (populated by UnmarshalJSON) tell
+// ApplyTo whether the key was present at all, so it can tell "leave
+// unchanged" apart from "clear it".
+//
+// UserID and Version stay required: UserID identifies who's performing
+// *this* update (not a resource field, so there's no "existing value" to
+// fall back to) and Version drives the optimistic-concurrency check.
+type PatchGeofenceRequest struct {
+	Name                  *string    `json:"name,omitempty" binding:"omitempty,min=2,max=150"`
+	GeoJson               *GeoJson   `json:"geo_json,omitempty"`
+	Status                *string    `json:"status,omitempty" binding:"omitempty,oneof=active inactive archived deleted"`
+	UserID                uuid.UUID  `json:"user_id" binding:"required"`
+	ClientID              *uuid.UUID `json:"client_id,omitempty"`
+	ExcludeFromColocation *bool      `json:"exclude_from_colocation,omitempty"`
+	Notes                 *string    `json:"notes,omitempty" binding:"omitempty,max=500"`
+	Version               uint64     `json:"version" binding:"required"`
+
+	clientIDSet bool
+	notesSet    bool
+}
+
+func (r *PatchGeofenceRequest) UnmarshalJSON(data []byte) error {
+	type alias PatchGeofenceRequest
+	if err := json.Unmarshal(data, (*alias)(r)); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	_, r.clientIDSet = raw["client_id"]
+	_, r.notesSet = raw["notes"]
+	return nil
+}
+
+// ApplyTo merges the patch onto an already-fetched entity, mutating only
+// the fields present in the request, and returns the column names that
+// changed for GeofenceDbAdapter.UpdateGeofence's selectFields — so the
+// UPDATE statement leaves every untouched column, including geometry/
+// geo_json, alone.
+func (r *PatchGeofenceRequest) ApplyTo(entity *dbmodel.Geofence, srid int) ([]any, error) {
+	var selectFields []any
+
+	if r.Name != nil {
+		if err := validateNameCharset(*r.Name); err != nil {
+			return nil, err
+		}
+		entity.Name = *r.Name
+		selectFields = append(selectFields, "name")
+	}
+
+	if r.GeoJson != nil {
+		geoJSONBytes, err := json.Marshal(*r.GeoJson)
+		if err != nil {
+			return nil, fmt.Errorf("marshal geo_json: %w", err)
+		}
+		geofenceType, geom, err := buildGeometry(*r.GeoJson, srid)
+		if err != nil {
+			return nil, err
+		}
+		entity.GeoJSON = string(geoJSONBytes)
+		entity.Type = geofenceType
+		entity.Geometry = geom
+		selectFields = append(selectFields, "geo_json", "type", "geometry")
+	}
+
+	if r.Status != nil {
+		entity.Status = StatusToDB(*r.Status)
+		selectFields = append(selectFields, "status")
+	}
+
+	if r.clientIDSet {
+		entity.ClientID = r.ClientID
+		selectFields = append(selectFields, "client_id")
+	}
+
+	if r.ExcludeFromColocation != nil {
+		entity.ExcludeFromColocation = *r.ExcludeFromColocation
+		selectFields = append(selectFields, "exclude_from_colocation")
+	}
+
+	if r.notesSet {
+		entity.Notes = r.Notes
+		selectFields = append(selectFields, "notes")
+	}
+
+	return selectFields, nil
 }
 
 // Geofence mirrors components.schemas.Geofence (GeofenceRequest + id/version/agency_id).
@@ -214,6 +315,11 @@ func (r *GeofenceRequest) ToModel(agencyID uuid.UUID, srid int) (*dbmodel.Geofen
 		return nil, fmt.Errorf("marshal geo_json: %w", err)
 	}
 
+	geofenceType, geom, err := buildGeometry(r.GeoJson, srid)
+	if err != nil {
+		return nil, err
+	}
+
 	entity := dbmodel.NewGeofence()
 	entity.AgencyID = agencyID
 	entity.ClientID = r.ClientID
@@ -223,35 +329,40 @@ func (r *GeofenceRequest) ToModel(agencyID uuid.UUID, srid int) (*dbmodel.Geofen
 	entity.GeoJSON = string(geoJSONBytes)
 	entity.ExcludeFromColocation = r.ExcludeFromColocation
 	entity.Notes = r.Notes
-
-	switch {
-	case r.GeoJson.Circle != nil:
-		geom, err := spatial.NewCircleGeometry(r.GeoJson.Circle.Coordinates, r.GeoJson.Circle.Radius, srid)
-		if err != nil {
-			return nil, err
-		}
-		entity.Type = dbmodel.GeofenceTypeCircle
-		entity.Geometry = geom
-	case r.GeoJson.Polygon != nil:
-		geom, err := spatial.NewPolygonGeometry(r.GeoJson.Polygon.Coordinates, srid)
-		if err != nil {
-			return nil, err
-		}
-		entity.Type = dbmodel.GeofenceTypePolygon
-		entity.Geometry = geom
-	case r.GeoJson.Rectangle != nil:
-		corners := r.GeoJson.Rectangle.Coordinates
-		geom, err := spatial.NewRectangleGeometry(corners[0], corners[1], srid)
-		if err != nil {
-			return nil, err
-		}
-		entity.Type = dbmodel.GeofenceTypeRectangle
-		entity.Geometry = geom
-	default:
-		return nil, fmt.Errorf("geo_json type %q is not a valid geofence shape (must be Circle, Polygon or Rectangle)", r.GeoJson.Type())
-	}
+	entity.Type = geofenceType
+	entity.Geometry = geom
 
 	return entity, nil
+}
+
+// buildGeometry constructs the write-only spatial.Geometry (and its
+// corresponding GeofenceType) from a geo_json value. Only Circle, Polygon
+// and Rectangle are valid geofence shapes (per the `type` CHECK constraint)
+// — Point is rejected.
+func buildGeometry(g GeoJson, srid int) (dbmodel.GeofenceType, spatial.Geometry, error) {
+	switch {
+	case g.Circle != nil:
+		geom, err := spatial.NewCircleGeometry(g.Circle.Coordinates, g.Circle.Radius, srid)
+		if err != nil {
+			return 0, spatial.Geometry{}, err
+		}
+		return dbmodel.GeofenceTypeCircle, geom, nil
+	case g.Polygon != nil:
+		geom, err := spatial.NewPolygonGeometry(g.Polygon.Coordinates, srid)
+		if err != nil {
+			return 0, spatial.Geometry{}, err
+		}
+		return dbmodel.GeofenceTypePolygon, geom, nil
+	case g.Rectangle != nil:
+		corners := g.Rectangle.Coordinates
+		geom, err := spatial.NewRectangleGeometry(corners[0], corners[1], srid)
+		if err != nil {
+			return 0, spatial.Geometry{}, err
+		}
+		return dbmodel.GeofenceTypeRectangle, geom, nil
+	default:
+		return 0, spatial.Geometry{}, fmt.Errorf("geo_json type %q is not a valid geofence shape (must be Circle, Polygon or Rectangle)", g.Type())
+	}
 }
 
 // FromModel converts a persisted geofence back into its API representation,

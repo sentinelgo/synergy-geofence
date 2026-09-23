@@ -2,13 +2,13 @@ version: 1.0.0
 common:
   server:
     host: 0.0.0.0
-    port: 7010
+    port: ${SERVER_PORT}
   datastore:
-    host: localhost
-    port: 1521
-    username: geofence_service
-    password: changeme
-    dbname: geofence.example.oraclevcn.com
+    host: ${ORACLE_HOST}
+    port: ${ORACLE_PORT}
+    username: ${ORACLE_USER}
+    password: "${ORACLE_PASSWORD}"
+    dbname: ${ORACLE_SERVICE_NAME}
     config:
       namingstrategy:
         identifiermaxlength: 128
@@ -18,26 +18,60 @@ common:
         varcharsizeischarlength: true
         namingcasesensitive: true
         sessiontimezone: UTC
-    migration:
-      enabled: true
-  sidecar:
-    base-url: http://localhost:8090
+    # Schema is owned by the DBA (see db/schema/*.sql) — this service never
+    # migrates the database itself, so migration.enabled is intentionally
+    # left unset rather than wired up here.
+  activity-log:
+    disabled: false
+    address: ${ACTIVITY_LOG_ADDRESS}
+  # Used for every agency-service m2m call (subagency hierarchy lookup,
+  # home-agency profile — see internal/handler/agency_client.go). The
+  # client-credentials client is a confidential Hydra client, one per
+  # environment, using client_secret_basic (auth-style: in-header) with
+  # agency.read as its only allowed scope.
+  agency:
+    base-url: ${AGENCY_SERVICE_BASE_URL}
+    client-credentials:
+      client-id: ${GEOFENCE_AGENCY_CLIENT_ID}
+      # A literal file path, not a ${...}-style substitution token — client-secret is
+      # util.FileOrContent (see synergy-common), which reads this path's
+      # content when it exists on disk rather than treating the string as
+      # inline content. The file is a dedicated Docker secret (see
+      # deploy/docker-stack*.yml's geofence_agency_client_secret secret and
+      # the Jenkinsfiles' "Create Agency Client Secret" stage) pulled from
+      # Vault at deploy time and mounted here — unlike every other value in
+      # this file, it's never baked into the geofence_config secret/rendered
+      # config.yml, and never passed as a container environment variable.
+      client-secret: /run/secrets/geofence_agency_client_secret
+      token-url: ${HYDRA_TOKEN_URL}
+      scopes: ["agency.read"]
+      # synergy-common v1.30.0's generated AuthStyle enumer ignores its `-transform map:`
+      # directive, so only the Go identifier names decode ("in-header" panics at startup).
+      auth-style: AuthStyleInHeader
+  geofence:
+    enabled: ${GEOFENCE_AUTH_ENABLED}
+    audience: ${GEOFENCE_AUTH_AUDIENCE}
+    userinfo-url: ${HYDRA_USERINFO_URL}
   jwt:
     verification:
-      # Disabled for local development so the service runs without a real
-      # IDP; flip to false (and confirm issuers/audiences) per environment
-      # to require and validate bearer tokens.
-      disabled: true
+      # Per environment: true where no real IDP is reachable (local/dev);
+      # false (with the issuers below actually enforced) once an environment
+      # has a real identity provider to validate bearer tokens against.
+      disabled: ${JWT_VERIFICATION_DISABLED}
       ignored:
         - method: "*"
           path: "/health"
+        - method: "*"
+          path: "/swagger(/.*)?"
+        - method: "*"
+          path: "/swagger-doc\\.yaml"
       issuers:
-        - issuer: https://id.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
-        - issuer: https://agency.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
-        - issuer: https://user.dev.sentinelsyn.com
-          audience: ["dev.sentinelsyn.com"]
+        - issuer: https://id.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
+        - issuer: https://agency.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
+        - issuer: https://user.${IDENTITY_DOMAIN}
+          audience: ["${IDENTITY_DOMAIN}"]
   signing:
     verification:
       block-unsigned: false
@@ -45,17 +79,21 @@ common:
       unsigned-paths:
         - method: "*"
           path: "/health"
+        - method: "*"
+          path: "^/swagger(/.*)?$"
+        - method: "*"
+          path: "^/swagger-doc\\.yaml$"
       allowed-issuers:
-        - https://id.dev.sentinelsyn.com
-        - https://user.dev.sentinelsyn.com
-        - https://agency.dev.sentinelsyn.com
+        - https://id.${IDENTITY_DOMAIN}
+        - https://user.${IDENTITY_DOMAIN}
+        - https://agency.${IDENTITY_DOMAIN}
       blacklisted-kids: []
 
 # Event publishing (Apache Pulsar) — see pkg/events. Disabled by default so
 # the service runs without a broker for local development; geofence
 # mutations simply won't be published until this is enabled.
 pulsar:
-  enabled: false
-  service-url: pulsar://localhost:6650
-  topic: persistent://synergy/geofence/events
+  enabled: true
+  service-url: ${PULSAR_URL}
+  topic: persistent://synergy/${ACTIVE_ENVIRONMENT}.geofences/geofence_events
   connection-timeout-seconds: 10
