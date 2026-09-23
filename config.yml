@@ -45,7 +45,9 @@ common:
       client-secret: /run/secrets/geofence_agency_client_secret
       token-url: ${HYDRA_TOKEN_URL}
       scopes: ["agency.read"]
-      auth-style: in-header
+      # synergy-common v1.30.0's generated AuthStyle enumer ignores its `-transform map:`
+      # directive, so only the Go identifier names decode ("in-header" panics at startup).
+      auth-style: AuthStyleInHeader
   geofence:
     enabled: ${GEOFENCE_AUTH_ENABLED}
     audience: ${GEOFENCE_AUTH_AUDIENCE}
