@@ -124,6 +124,22 @@ func containsFold(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), substr)
 }
 
+// CircleRadius returns a Circle geofence's radius (meters) from its
+// geo_json, and false for any other shape (Polygon/Rectangle have no
+// radius), a missing/non-positive radius, or invalid JSON.
+func CircleRadius(g *dbmodel.Geofence) (float64, bool) {
+	if g == nil || g.Type != dbmodel.GeofenceTypeCircle {
+		return 0, false
+	}
+	var doc struct {
+		Radius *float64 `json:"radius"`
+	}
+	if json.Unmarshal([]byte(g.GeoJSON), &doc) != nil || doc.Radius == nil || *doc.Radius <= 0 {
+		return 0, false
+	}
+	return *doc.Radius, true
+}
+
 // AddressText extracts a flattened, human-readable address string from a
 // geofence's geo_json for search matching (e.g. "123 Main St Atlanta GA
 // 30301") — built from the parsed address object's own fields (street1,

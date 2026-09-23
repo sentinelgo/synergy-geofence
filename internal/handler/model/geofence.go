@@ -298,6 +298,18 @@ type Geofence struct {
 	ExcludeFromColocation bool       `json:"exclude_from_colocation"`
 	Notes                 *string    `json:"notes,omitempty"`
 	Version               uint64     `json:"version"`
+	// HomeAgency is the owning agency (AgencyID) with its agency-service
+	// details, looked up per request — set by ListGeofences only.
+	HomeAgency *HomeAgency `json:"home_agency,omitempty"`
+}
+
+// HomeAgency is a geofence's owning agency as ListGeofences returns it.
+// SynergyIdentifier/Name are omitted when the agency service couldn't be
+// reached (see GeofenceController.resolveListScope).
+type HomeAgency struct {
+	ID                uuid.UUID `json:"id"`
+	SynergyIdentifier string    `json:"synergy_identifier,omitempty"`
+	Name              string    `json:"name,omitempty"`
 }
 
 // ToModel converts a validated create/update request into the persistence

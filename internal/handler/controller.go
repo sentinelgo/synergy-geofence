@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -52,7 +53,7 @@ type GeofenceController struct {
 	// config.ClientCredentialsConfig.Client) used for the agency-service
 	// m2m hierarchy call (FetchHierarchy) — nil if
 	// common.agency.client-credentials isn't configured, in which case
-	// that call fails gracefully (see resolveListAgencyIDs) rather than the
+	// that call fails gracefully (see resolveListScope) rather than the
 	// service failing to start.
 	m2mAcli *http.Client
 }
@@ -209,17 +210,17 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 	// The agency scope is always resolved server-side — the path agency,
 	// plus (with includeSubagency) the subagencies the caller may see —
 	// never taken from the request. home_agency can only narrow it further.
-	agencyIDs, err := x.resolveListAgencyIDs(c, agencyID, filters.includeSubagency)
+	agencyIDs, homeAgencies, err := x.resolveListScope(c, agencyID, filters.includeSubagency)
 	if err != nil {
 		// Only the agency-service hierarchy lookup can fail here (auth
-		// failures abort inside resolveListAgencyIDs instead), so this is an
+		// failures abort inside resolveListScope instead), so this is an
 		// upstream outage — report it as one, not as a 403.
 		l.With("error", err).Error("failed to resolve list agency scope")
 		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrAgencyService, localerrors.AgencyId)})
 		return
 	}
-	// resolveListAgencyIDs may itself have already written a 403 (no
-	// service claims) and returned nil, nil — stop here rather than
+	// resolveListScope may itself have already written a 403 (no
+	// service claims) and returned nil, nil, nil — stop here rather than
 	// querying and appending the list to that response.
 	if c.IsAborted() {
 		return
@@ -246,7 +247,7 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 		}
 	}
 
-	sortGeofences(matched, filters.sortField, filters.order)
+	sortGeofences(matched, filters.sortField, filters.order, homeAgencySynergyIDs(homeAgencies))
 
 	total := len(matched)
 	pages := 0
@@ -278,6 +279,11 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{pkg.ErrorKey: localerrors.NewError(localerrors.ErrConvertData, localerrors.Geofence)})
 			return
 		}
+		resp.HomeAgency = &hmodel.HomeAgency{ID: entity.AgencyID}
+		if info, ok := homeAgencies[entity.AgencyID]; ok {
+			resp.HomeAgency.SynergyIdentifier = info.SynergyIdentifier
+			resp.HomeAgency.Name = info.Name
+		}
 		items = append(items, resp)
 	}
 
@@ -292,23 +298,38 @@ func (x *GeofenceController) ListGeofences(c *gin.Context) {
 	})
 }
 
-// resolveListAgencyIDs returns the agency scope ListGeofences queries: the
+// homeAgencyLookupTimeout bounds the best-effort single-agency lookup in
+// resolveListScope, so a slow agency service delays a plain list by at
+// most this long (it's display-only; the list still succeeds without it).
+const homeAgencyLookupTimeout = 2 * time.Second
+
+// resolveListScope returns the agency scope ListGeofences queries — the
 // path agency first, then (with includeSubagency) every subagency from the
-// agency service's hierarchy that the caller may see — all of them for
+// agency service's hierarchy that the caller may see: all of them for
 // sentinel System/Global/Read-Only Administrators, otherwise only agencies
-// the caller is associated with. With JWT verification disabled (the same
-// dev-only bypass requireAgencyViewer honors) there are no claims to check,
-// so the whole hierarchy is included. Without service claims otherwise, it
-// writes a 403 itself and returns nil, nil (callers must check
-// c.IsAborted()); a non-nil error always means the agency-service call
-// failed.
-func (x *GeofenceController) resolveListAgencyIDs(
+// the caller is associated with — plus each in-scope agency's
+// agency-service details (synergy identifier, name), used to display and
+// sort by the geofences' home agency. Nothing is stored; it's looked up per
+// request.
+//
+// With includeSubagency the details come free with the hierarchy call, and
+// a failure there is returned as an error (the scope can't be resolved).
+// Without it, the scope is just the path agency and its details come from a
+// separate best-effort lookup: on failure it's logged and the details are
+// simply missing (never an error), since they're display-only.
+//
+// With JWT verification disabled (the same dev-only bypass
+// requireAgencyViewer honors) there are no claims to check, so the whole
+// hierarchy is included. Without service claims otherwise, it writes a 403
+// itself and returns nil, nil, nil (callers must check c.IsAborted()); a
+// non-nil error always means the agency-service hierarchy call failed.
+func (x *GeofenceController) resolveListScope(
 	c *gin.Context,
 	agencyID uuid.UUID,
 	includeSubagency bool,
-) ([]uuid.UUID, error) {
+) ([]uuid.UUID, map[uuid.UUID]agencyInfo, error) {
 	if !includeSubagency {
-		return []uuid.UUID{agencyID}, nil
+		return []uuid.UUID{agencyID}, x.lookupHomeAgency(c, agencyID), nil
 	}
 
 	claims := pkg.Claims(c)
@@ -317,17 +338,17 @@ func (x *GeofenceController) resolveListAgencyIDs(
 
 	if svc == nil && !verificationDisabled {
 		abortForbidden(c, claims, pkg.AgencyID(c))
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	client, err := newAgencyClient(x.cfg, x.m2mAcli)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	rawIDs, err := client.FetchHierarchy(c, agencyID)
+	hierarchy, err := client.FetchHierarchy(c, agencyID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	seeAll := svc == nil || // only reachable with verification disabled
@@ -335,23 +356,51 @@ func (x *GeofenceController) resolveListAgencyIDs(
 		svc.IsGlobalAdmin() ||
 		svc.IsReadOnlyAdmin()
 
-	agencyIDs := make([]uuid.UUID, 0, len(rawIDs)+1)
+	agencyIDs := make([]uuid.UUID, 0, len(hierarchy)+1)
 	agencyIDs = append(agencyIDs, agencyID)
 
-	agencyIDs = append(agencyIDs, UniqueBy(rawIDs, func(id uuid.UUID) (uuid.UUID, bool) {
+	agencyIDs = append(agencyIDs, UniqueBy(hierarchy, func(a agencyInfo) (uuid.UUID, bool) {
 		// The hierarchy includes the path agency itself (its root) — it's
 		// already first in agencyIDs.
-		if id == uuid.Nil || id == agencyID {
+		if a.ID == uuid.Nil || a.ID == agencyID {
 			return uuid.Nil, false
 		}
 		if seeAll {
-			return id, true
+			return a.ID, true
 		}
 
-		return id, svc.MetadataPublic.Association(id.String()) != ""
+		return a.ID, svc.MetadataPublic.Association(a.ID.String()) != ""
 	})...,
 	)
-	return agencyIDs, nil
+
+	// Only keep details for agencies actually in scope.
+	details := make(map[uuid.UUID]agencyInfo, len(agencyIDs))
+	for _, a := range hierarchy {
+		if slices.Contains(agencyIDs, a.ID) {
+			details[a.ID] = a
+		}
+	}
+	return agencyIDs, details, nil
+}
+
+// lookupHomeAgency is resolveListScope's best-effort single-agency details
+// lookup: nil (not an error) if the agency service is unconfigured,
+// unreachable or slow.
+func (x *GeofenceController) lookupHomeAgency(c *gin.Context, agencyID uuid.UUID) map[uuid.UUID]agencyInfo {
+	l := log.LoggerFromContext(c)
+	client, err := newAgencyClient(x.cfg, x.m2mAcli)
+	if err != nil {
+		l.With("error", err).Warn("could not build agency client, home agency details will be omitted")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(c, homeAgencyLookupTimeout)
+	defer cancel()
+	info, err := client.FetchAgency(ctx, agencyID)
+	if err != nil {
+		l.With("error", err).Warn("could not look up home agency, its details will be omitted")
+		return nil
+	}
+	return map[uuid.UUID]agencyInfo{agencyID: info}
 }
 
 func (x *GeofenceController) UpdateGeofence(c *gin.Context) {

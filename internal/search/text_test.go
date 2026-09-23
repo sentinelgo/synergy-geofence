@@ -152,3 +152,27 @@ func TestMatchesFields_NilGeofence(t *testing.T) {
 		t.Error("MatchesFields(nil, no filters) = false, want true")
 	}
 }
+
+func TestCircleRadius(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		g      *dbmodel.Geofence
+		want   float64
+		wantOK bool
+	}{
+		{name: "circle", g: &dbmodel.Geofence{Type: dbmodel.GeofenceTypeCircle, GeoJSON: `{"type":"Circle","coordinates":[-84.388,33.749],"radius":750.5}`}, want: 750.5, wantOK: true},
+		{name: "polygon has no radius", g: &dbmodel.Geofence{Type: dbmodel.GeofenceTypePolygon, GeoJSON: `{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}`}},
+		{name: "rectangle has no radius", g: &dbmodel.Geofence{Type: dbmodel.GeofenceTypeRectangle, GeoJSON: `{"type":"Rectangle","coordinates":[[0,0],[1,1]],"radius":10}`}},
+		{name: "circle missing radius", g: &dbmodel.Geofence{Type: dbmodel.GeofenceTypeCircle, GeoJSON: `{"type":"Circle","coordinates":[0,0]}`}},
+		{name: "circle zero radius", g: &dbmodel.Geofence{Type: dbmodel.GeofenceTypeCircle, GeoJSON: `{"type":"Circle","coordinates":[0,0],"radius":0}`}},
+		{name: "invalid json", g: &dbmodel.Geofence{Type: dbmodel.GeofenceTypeCircle, GeoJSON: `not json`}},
+		{name: "nil", g: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := CircleRadius(tc.g)
+			if ok != tc.wantOK || got != tc.want {
+				t.Errorf("CircleRadius = (%v, %v), want (%v, %v)", got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}

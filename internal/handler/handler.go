@@ -170,7 +170,7 @@ func Execute() {
 	// this environment) degrades gracefully to gohttp.DefaultClient rather
 	// than blocking startup — newAgencyClient's own baseURL/nil checks
 	// already make that m2m call fail gracefully at call time (see
-	// resolveListAgencyIDs), the same way an unset
+	// resolveListScope), the same way an unset
 	// common.agency.base-url does today.
 	m2mAcli, m2mAcliErr := cfg.Common.Agency.ClientCredentials.Client(context.Background())
 	if m2mAcliErr != nil {

@@ -275,8 +275,8 @@ paths:
           in: query
           schema:
             type: string
-            enum: [name, exclude_from_colocation, address]
-          description: Field to sort by, applied in memory after the DB fetch (see the q parameter above) — exactly the same fields q searches. address sorts by the geofence's street address; geofences with no address sort last regardless of direction. Coordinates/radius aren't sortable (same reason they aren't searchable). Omit to keep the default (most recently created first).
+            enum: [name, exclude_from_colocation, address, home_agency, radius]
+          description: Field to sort by, applied in memory after the DB fetch (see the q parameter above). home_agency sorts by the owning agency's synergy identifier (the value shown in each item's home_agency.synergy_identifier), looked up from the agency service per request — not stored, and not searchable; geofences whose identifier couldn't be looked up sort last. address sorts by the geofence's street address; geofences with no address sort last regardless of direction. radius sorts numerically by the Circle radius (meters) in geo_json — only Circle geofences have one, so Polygon/Rectangle geofences sort last regardless of direction; radius still isn't searchable. Coordinates aren't sortable. Omit to keep the default (most recently created first).
         - name: order
           in: query
           schema:
@@ -805,6 +805,27 @@ components:
             version:
               type: integer
               description: Version number of the geofence record, incremented on each update.
+            home_agency:
+              type: object
+              description: >
+                List responses only. The geofence's owning agency (same as
+                agency_id) with its agency-service details, looked up per
+                request — nothing is stored. With includeSubagency the
+                details come from the hierarchy lookup; otherwise from a
+                best-effort single-agency lookup, and synergy_identifier /
+                name are omitted if the agency service couldn't be reached
+                (the list itself still succeeds).
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  format: uuid
+                synergy_identifier:
+                  type: string
+                  example: 'SYN123'
+                name:
+                  type: string
+                  example: 'Fulton County Probation'
 
     GeofenceListRequest:
       type: object
@@ -930,14 +951,18 @@ components:
               example: active
             sort_by:
               type: string
-              enum: [name, exclude_from_colocation, address]
+              enum: [name, exclude_from_colocation, address, home_agency, radius]
               description: >
                 Equivalent to the sort_by query param, applied in memory
-                after the DB fetch. address sorts by the
+                after the DB fetch. home_agency sorts by the owning agency's
+                synergy identifier, looked up from the agency service per
+                request (not stored). address sorts by the
                 geofence's street address (geofences with no address sort
-                last, regardless of direction). Coordinates/radius aren't
-                sortable (same reason they aren't searchable). Omit to
-                keep the default order (most recently created first).
+                last, regardless of direction). radius sorts numerically
+                by the Circle radius in geo_json; Polygon/Rectangle
+                geofences have none and sort last, regardless of direction.
+                Coordinates aren't sortable. Omit to keep the default order
+                (most recently created first).
               example: name
             order:
               type: string

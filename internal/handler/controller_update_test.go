@@ -528,23 +528,6 @@ func TestListGeofences_SortsByAddress(t *testing.T) {
 	}
 }
 
-// TestListGeofences_RejectsSortByHomeAgency confirms home_agency is no
-// longer a sort_by value (it's an agency UUID, with nothing meaningful to
-// sort by).
-func TestListGeofences_RejectsSortByHomeAgency(t *testing.T) {
-	agencyID := uuid.New()
-	ctrl := newTestController(&fakeGeofenceDbAdapter{}, &fakeActivityLogger{})
-
-	c, w := newTestGinContext(t, http.MethodGet,
-		"/agencies/"+agencyID.String()+"/geofences?sort_by=home_agency", "", nil, agencyID)
-
-	ctrl.ListGeofences(c)
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
-	}
-}
-
 // TestListGeofences_AcceptsBodyRequest exercises the LIST-body envelope
 // (mirroring sso-user-service's UserListRequest): search/pagination/data
 // all supplied in the JSON body instead of query params, on the same route
